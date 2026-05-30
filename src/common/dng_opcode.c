@@ -126,6 +126,9 @@ void dt_dng_opcode_process_opcode_list_2(uint8_t *buf, uint32_t buf_size, dt_ima
 
 void dt_dng_opcode_process_opcode_list_3(uint8_t *buf, uint32_t buf_size, dt_image_t *img)
 {
+  g_list_free_full(img->dng_gain_maps, g_free);
+  img->dng_gain_maps = NULL;
+
   dt_image_correction_data_t *cd = &img->exif_correction_data;
   cd->dng.has_warp = FALSE;
   cd->dng.has_vignette = FALSE;
