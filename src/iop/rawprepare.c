@@ -624,7 +624,7 @@ int process_cl(dt_iop_module_t *self,
       err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
       dev_gainmap_rgb[p] = dt_opencl_alloc_device(devid, map_size[0], map_size[1], sizeof(float));
       if(dev_gainmap_rgb[p] == NULL) goto finish;
-      err = dt_opencl_write_host_to_device(devid, gainmap_rgb_plane[p], dev_gainmap_rgb[p],
+      err = dt_opencl_write_host_to_image(devid, gainmap_rgb_plane[p], dev_gainmap_rgb[p],
                                            map_size[0], map_size[1], sizeof(float));
       if(err != CL_SUCCESS) goto finish;
     }
