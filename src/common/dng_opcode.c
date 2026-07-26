@@ -57,7 +57,7 @@ static uint32_t _get_long(uint8_t *ptr)
   return GUINT32_FROM_BE(in);
 }
 
-static void _parse_and_append_gain_map(uint8_t *param, uint32_t param_size, dt_image_t *img,
+static void _parse_and_append_gain_map(uint8_t *param, uint32_t param_size, GList **dng_gain_maps,
                                         const char *source)
 {
   uint32_t gain_count = (param_size - 76) / 4;
@@ -79,7 +79,7 @@ static void _parse_and_append_gain_map(uint8_t *param, uint32_t param_size, dt_i
   gm->map_planes    = _get_long(&param[72]);
   for(int i = 0; i < gain_count; i++)
     gm->map_gain[i] = _get_float(&param[76 + 4 * i]);
-  img->dng_gain_maps = g_list_append(img->dng_gain_maps, gm);
+  *dng_gain_maps = g_list_append(*dng_gain_maps, gm);
   dt_print(DT_DEBUG_IMAGEIO,
     "[dng_opcode] %s GainMap parsed: top=%u left=%u bottom=%u right=%u "
     "plane=%u planes=%u row_pitch=%u col_pitch=%u "
@@ -111,7 +111,7 @@ void dt_dng_opcode_process_opcode_list_2(uint8_t *buf, uint32_t buf_size, dt_ima
 
     if(opcode_id == OPCODE_ID_GAINMAP)
     {
-      _parse_and_append_gain_map(param, param_size, img, "OpcodeList2");
+      _parse_and_append_gain_map(param, param_size, &(img->dng_gain_maps), "OpcodeList2");
     }
     else
     {
@@ -126,8 +126,8 @@ void dt_dng_opcode_process_opcode_list_2(uint8_t *buf, uint32_t buf_size, dt_ima
 
 void dt_dng_opcode_process_opcode_list_3(uint8_t *buf, uint32_t buf_size, dt_image_t *img)
 {
-  g_list_free_full(img->dng_gain_maps, g_free);
-  img->dng_gain_maps = NULL;
+  g_list_free_full(img->dng_gain_maps_opcode3, g_free);
+  img->dng_gain_maps_opcode3 = NULL;
 
   dt_image_correction_data_t *cd = &img->exif_correction_data;
   cd->dng.has_warp = FALSE;
@@ -184,7 +184,7 @@ void dt_dng_opcode_process_opcode_list_3(uint8_t *buf, uint32_t buf_size, dt_ima
 
     else if(opcode_id == OPCODE_ID_GAINMAP)
     {
-      _parse_and_append_gain_map(param, param_size, img, "OpcodeList3");
+      _parse_and_append_gain_map(param, param_size, &(img->dng_gain_maps_opcode3), "OpcodeList3");
     }
 
     else

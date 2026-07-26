@@ -814,15 +814,20 @@ static gboolean _check_gain_maps(dt_iop_module_t *self, dt_dng_gain_map_t **gain
   return TRUE;
 }
 
-// check for a single RGB GainMap (DJI-style: 1 map, planes=3, row_pitch=1, col_pitch=1)
+// check for a single RGB GainMap (DJI-style: 1 map, planes=3, row_pitch=1, col_pitch=1, cover full image)
 static dt_dng_gain_map_t *_check_gain_map_rgb(dt_iop_module_t *self)
 {
   const dt_image_t *const image = &(self->dev->image_storage);
 
-  if(g_list_length(image->dng_gain_maps) != 1)
+  if(g_list_length(image->dng_gain_maps_opcode3) != 1)
+  {
+    dt_print(DT_DEBUG_IMAGEIO,
+      "[rawprepare] _check_gain_map_rgb: found %u GainMaps, need exactly 1",
+      g_list_length(image->dng_gain_maps_opcode3));
     return NULL;
+  }
 
-  dt_dng_gain_map_t *g = g_list_nth_data(image->dng_gain_maps, 0);
+  dt_dng_gain_map_t *g = g_list_nth_data(image->dng_gain_maps_opcode3, 0);
   if(g == NULL
      || g->plane != 0
      || g->planes != 3
@@ -831,16 +836,19 @@ static dt_dng_gain_map_t *_check_gain_map_rgb(dt_iop_module_t *self)
      || g->col_pitch != 1
      || g->map_points_v < 2
      || g->map_points_h < 2
+     || g->top != 0
+     || g->left != 0
      || g->bottom != image->height
      || g->right != image->width)
   {
     dt_print(DT_DEBUG_IMAGEIO,
       "[rawprepare] _check_gain_map_rgb: map rejected: "
       "plane=%u planes=%u map_planes=%u row_pitch=%u col_pitch=%u "
-      "map_points_v=%u map_points_h=%u bottom=%u right=%u (image %ux%u)",
+      "map_points_v=%u map_points_h=%u top=%u left=%u bottom=%u right=%u (image %ux%u)",
       g ? g->plane : 0, g ? g->planes : 0, g ? g->map_planes : 0,
       g ? g->row_pitch : 0, g ? g->col_pitch : 0,
       g ? g->map_points_v : 0, g ? g->map_points_h : 0,
+      g ? g->top : 0, g ? g->left : 0,
       g ? g->bottom : 0, g ? g->right : 0,
       image->width, image->height);
     return NULL;
