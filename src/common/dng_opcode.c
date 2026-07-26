@@ -57,6 +57,38 @@ static uint32_t _get_long(uint8_t *ptr)
   return GUINT32_FROM_BE(in);
 }
 
+static void _parse_and_append_gain_map(uint8_t *param, uint32_t param_size, GList **dng_gain_maps,
+                                        const char *source)
+{
+  uint32_t gain_count = (param_size - 76) / 4;
+  dt_dng_gain_map_t *gm = g_malloc(sizeof(dt_dng_gain_map_t) + gain_count * sizeof(float));
+  gm->top           = _get_long(&param[0]);
+  gm->left          = _get_long(&param[4]);
+  gm->bottom        = _get_long(&param[8]);
+  gm->right         = _get_long(&param[12]);
+  gm->plane         = _get_long(&param[16]);
+  gm->planes        = _get_long(&param[20]);
+  gm->row_pitch     = _get_long(&param[24]);
+  gm->col_pitch     = _get_long(&param[28]);
+  gm->map_points_v  = _get_long(&param[32]);
+  gm->map_points_h  = _get_long(&param[36]);
+  gm->map_spacing_v = _get_double(&param[40]);
+  gm->map_spacing_h = _get_double(&param[48]);
+  gm->map_origin_v  = _get_double(&param[56]);
+  gm->map_origin_h  = _get_double(&param[64]);
+  gm->map_planes    = _get_long(&param[72]);
+  for(int i = 0; i < gain_count; i++)
+    gm->map_gain[i] = _get_float(&param[76 + 4 * i]);
+  *dng_gain_maps = g_list_append(*dng_gain_maps, gm);
+  dt_print(DT_DEBUG_IMAGEIO,
+    "[dng_opcode] %s GainMap parsed: top=%u left=%u bottom=%u right=%u "
+    "plane=%u planes=%u row_pitch=%u col_pitch=%u "
+    "map_points_v=%u map_points_h=%u map_planes=%u gain_count=%u",
+    source, gm->top, gm->left, gm->bottom, gm->right,
+    gm->plane, gm->planes, gm->row_pitch, gm->col_pitch,
+    gm->map_points_v, gm->map_points_h, gm->map_planes, gain_count);
+}
+
 void dt_dng_opcode_process_opcode_list_2(uint8_t *buf, uint32_t buf_size, dt_image_t *img)
 {
   g_list_free_full(img->dng_gain_maps, g_free);
@@ -79,27 +111,7 @@ void dt_dng_opcode_process_opcode_list_2(uint8_t *buf, uint32_t buf_size, dt_ima
 
     if(opcode_id == OPCODE_ID_GAINMAP)
     {
-      uint32_t gain_count = (param_size - 76) / 4;
-      dt_dng_gain_map_t *gm = g_malloc(sizeof(dt_dng_gain_map_t) + gain_count * sizeof(float));
-      gm->top = _get_long(&param[0]);
-      gm->left = _get_long(&param[4]);
-      gm->bottom = _get_long(&param[8]);
-      gm->right = _get_long(&param[12]);
-      gm->plane = _get_long(&param[16]);
-      gm->planes = _get_long(&param[20]);
-      gm->row_pitch = _get_long(&param[24]);
-      gm->col_pitch = _get_long(&param[28]);
-      gm->map_points_v = _get_long(&param[32]);
-      gm->map_points_h = _get_long(&param[36]);
-      gm->map_spacing_v = _get_double(&param[40]);
-      gm->map_spacing_h = _get_double(&param[48]);
-      gm->map_origin_v = _get_double(&param[56]);
-      gm->map_origin_h = _get_double(&param[64]);
-      gm->map_planes = _get_long(&param[72]);
-      for(int i = 0; i < gain_count; i++)
-        gm->map_gain[i] = _get_float(&param[76 + 4*i]);
-
-      img->dng_gain_maps = g_list_append(img->dng_gain_maps, gm);
+      _parse_and_append_gain_map(param, param_size, &(img->dng_gain_maps), "OpcodeList2");
     }
     else
     {
@@ -114,6 +126,9 @@ void dt_dng_opcode_process_opcode_list_2(uint8_t *buf, uint32_t buf_size, dt_ima
 
 void dt_dng_opcode_process_opcode_list_3(uint8_t *buf, uint32_t buf_size, dt_image_t *img)
 {
+  g_list_free_full(img->dng_gain_maps_opcode3, g_free);
+  img->dng_gain_maps_opcode3 = NULL;
+
   dt_image_correction_data_t *cd = &img->exif_correction_data;
   cd->dng.has_warp = FALSE;
   cd->dng.has_vignette = FALSE;
@@ -165,6 +180,11 @@ void dt_dng_opcode_process_opcode_list_3(uint8_t *buf, uint32_t buf_size, dt_ima
 
       cd->dng.has_vignette = TRUE;
       img->exif_correction_type = CORRECTION_TYPE_DNG;
+    }
+
+    else if(opcode_id == OPCODE_ID_GAINMAP)
+    {
+      _parse_and_append_gain_map(param, param_size, &(img->dng_gain_maps_opcode3), "OpcodeList3");
     }
 
     else
