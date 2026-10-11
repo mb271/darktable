@@ -129,6 +129,48 @@
 
 darktable_t darktable;
 
+#ifdef _WIN32
+static gboolean _console_notice_requested = FALSE;
+
+void dt_request_console_notice(void)
+{
+  _console_notice_requested = TRUE;
+}
+
+static void _show_console_notice(void)
+{
+  const char *notice = _("this console window is required by darktable on this "
+                         "version of Windows.\n"
+                         "on Windows 11 24H2 and later, darktable normally runs "
+                         "without this window.\n"
+                         "do not close it or press ctrl+c while darktable is running.\n"
+                         "it will close automatically when darktable exits.\n"
+                         "\n"
+                         "to hide this window anyway, follow the instructions at:\n"
+                         "https://www.darktable.org/about/faq/#faq-windows-terminal\n");
+  gchar **notice_lines = g_strsplit(notice, "\n", -1);
+  gchar *console_notice = g_strjoinv("\r\n", notice_lines);
+  g_strfreev(notice_lines);
+
+  glong length = 0;
+  gunichar2 *wide_notice = g_utf8_to_utf16(console_notice, -1, NULL, &length, NULL);
+  g_free(console_notice);
+  if(!wide_notice) return;
+
+  const HANDLE output = CreateFileW(L"CONOUT$", GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                    OPEN_EXISTING, 0, NULL);
+  if(output != INVALID_HANDLE_VALUE)
+  {
+    DWORD written;
+    WriteConsoleW(output, wide_notice, (DWORD)length, &written, NULL);
+    CloseHandle(output);
+  }
+
+  g_free(wide_notice);
+}
+#endif
+
 static int usage(const char *argv0)
 {
 #ifdef _WIN32
@@ -222,6 +264,15 @@ static int usage(const char *argv0)
          "    Typical locations are /opt/darktable/share/darktable/noiseprofile.json\n"
          "    and /usr/share/darktable/noiseprofile.json\n"
          "\n"
+         "--print-paths\n"
+         "    Print the resolved configdir, cachedir, tmpdir, datadir,\n"
+         "    moduledir, localedir and library paths for this install,\n"
+         "    honoring any of the above overrides, then exit.\n"
+         "\n"
+         "--print-paths-as-flags\n"
+         "    Like --print-paths, but printed as a single line of\n"
+         "    --flag value pairs ready to splice into another invocation.\n"
+         "\n"
          "-t, --threads NUM\n"
          "    Limit number of openmp threads to use in openmp parallel sections\n"
          "\n"
@@ -246,6 +297,18 @@ static int usage(const char *argv0)
          "--disable-opencl\n"
          "    Prevent darktable from initializing the OpenCL subsystem.\n"
          "\n"
+         "--opencl-tiling --opencl-no-tiling\n"
+         "    Enforce or disable fast opencl tiling even if not required.\n"
+         "    Use for performance/debugging sessions only.\n"
+         "\n"
+         "--opencl-migrate\n"
+         "    Enforce safe on-device cl_mem allocation.\n"
+         "    Use for debugging sessions analysing cl_mem usage because of a performance penalty.\n"
+         "\n"
+         "--opencl-diffstat\n"
+         "    Report statistics about OpenCL vs CPU module processing.\n"
+         "    Use for debugging sessions only.\n"
+         "\n"
 #endif
          "--disable-pipecache\n"
          "    Disable the pixelpipe cache. This option allows only\n"
@@ -264,9 +327,9 @@ static int usage(const char *argv0)
          "    Enable debug output to the terminal (or to the log file if on Windows).\n"
          "    Valid channels are:\n\n"
          "    act_on, ai, cache, camctl, camsupport, control, dev, expose,\n"
-         "    imageio, input, ioporder, lighttable, lua, masks, memory,\n"
-         "    nan, opencl, params, perf, pipe, print, pwstorage, signal,\n"
-         "    sql, tiling, picker, undo\n"
+         "    hdr_merge, imageio, input, ioporder, lighttable, lua, masks,\n"
+         "    memory, nan, opencl, params, perf, pipe, print, pwstorage,\n"
+         "    signal, sql, tiling, picker, undo\n"
          "\n"
          "    It is also possible to specify names that activate all channels\n"
          "    or a certain subset, as well as increase verbosity:\n"
@@ -605,20 +668,18 @@ void dt_dump_pfm_file(
   }
 
   char fname[256]= { 0 };
-  snprintf(fname, sizeof(fname), "%04d_%s_%s_%s%s.%s",
+  snprintf(fname, sizeof(fname), "%04d_%s_%s%s.%s",
      written,
      modname,
-     cpu ? "cpu" : "GPU",
-     (input && output) ? "diff_" : ((!input && !output) ? "" : ((input) ? "in_" : "out_")),
-     (bpp != 16) ? "M" : "C",
-     (bpp==2) ? "ppm" : "pfm");
-
+     (input && output) ? "diff" : cpu ? "cpu" : "gpu",
+     (input && output) ? "" : ((!input && !output) ? "" : ((input) ? "_in" : "_out")),
+     bpp == sizeof(float) || bpp == sizeof(uint16_t) ? "pgm" : "ppm");
 
   if((width < 1) || (height < 1) || !data)
     goto finalize;
 
   fullname = g_build_filename(path, fname, NULL);
-  dt_write_pfm(fullname, width, height, data, bpp);
+  dt_write_ppm(fullname, width, height, data, bpp);
 
   dt_print(DT_DEBUG_ALWAYS, "%-20s %s,  %dx%d, bpp=%d", head, fullname, width, height, bpp);
   written += 1;
@@ -809,6 +870,25 @@ static char *_get_version_string(void)
   #endif
 #endif
 
+#if (defined(__amd64__) || defined(__amd64) || defined(__x86_64__) || defined(__x86_64))
+  #if !defined(__SSE2__) || !defined(__SSE__)
+    const char *platform_name = "x64";
+  #else
+    const char *platform_name = "x64 sse2";
+  #endif
+#else
+  #if defined(__aarch64__) && (defined(__ARM_64BIT_STATE) && defined(__ARM_ARCH) && (defined(__ARM_ARCH_8A) || __ARM_ARCH_PROFILE == 'A') || defined(__APPLE__) || defined(__MINGW64__))
+    #if defined(__ARM_NEON)
+      const char *platform_name = "arm neon";
+    #else
+      const char *platform_name = "arm";
+    #endif
+  #else
+    const char *platform_name = "other";
+  #endif
+#endif
+
+
 #ifdef USE_LUA
   const char *lua_api_version = strcmp(LUA_API_VERSION_SUFFIX, "") ?
                                        STR(LUA_API_VERSION_MAJOR) "."
@@ -821,17 +901,16 @@ static char *_get_version_string(void)
 #endif
 
 char *version = g_strdup_printf(
-               "darktable %s [%s]\n"
+               "darktable %s [%s %s]\n"
                "Copyright (C) 2012-%s Johannes Hanika and other contributors.\n\n"
                "Compile options:\n"
-               "  Bit depth              -> %zu bit\n"
                "%s%s%s%s%s%s%s%s%s\n"
                "See %s for detailed documentation.\n"
                "See %s to report bugs.\n",
                darktable_package_version,
                system_name,
+               platform_name,
                darktable_last_commit_year,
-               CHAR_BIT * sizeof(void *),
 
                "  Exiv2                  -> ", exiv2_version,
                "  Lensfun                -> ", liblensfun_version,
@@ -839,12 +918,6 @@ char *version = g_strdup_printf(
                "  Debug                  -> ENABLED\n"
 #else
                "  Debug                  -> DISABLED\n"
-#endif
-
-#if defined(__SSE2__) && defined(__SSE__)
-               "  SSE2 optimizations     -> ENABLED\n"
-#else
-               "  SSE2 optimizations     -> DISABLED\n"
 #endif
 
 #ifdef _OPENMP
@@ -857,6 +930,12 @@ char *version = g_strdup_printf(
                "  OpenCL                 -> ENABLED\n"
 #else
                "  OpenCL                 -> DISABLED - GPU acceleration is NOT available\n"
+#endif
+
+#ifdef HAVE_OPENCV
+               "  OpenCV                 -> ENABLED  - HDR bracket auto-alignment is available\n"
+#else
+               "  OpenCV                 -> DISABLED - HDR bracket auto-alignment is NOT available\n"
 #endif
 
 #ifdef USE_LUA
@@ -961,8 +1040,6 @@ int dt_init(int argc,
             const gboolean load_data,
             lua_State *L)
 {
-  const double start_wtime = dt_get_wtime();
-
 #ifndef _WIN32
   if(getuid() == 0 || geteuid() == 0)
     dt_print(DT_DEBUG_ALWAYS,
@@ -986,24 +1063,19 @@ int dt_init(int argc,
   // init all pointers to 0:
   memset(&darktable, 0, sizeof(darktable_t));
 
-  darktable.start_wtime = start_wtime;
+  darktable.start_mtime = g_get_monotonic_time();
 
   darktable.progname = argv[0];
 
-  // FIXME: move there into dt_database_t
-  pthread_mutexattr_t recursive_locking;
-  pthread_mutexattr_init(&recursive_locking);
-  pthread_mutexattr_settype(&recursive_locking, PTHREAD_MUTEX_RECURSIVE);
   for(int k=0; k<DT_IMAGE_DBLOCKS; k++)
-  {
-    dt_pthread_mutex_init(&darktable.db_image[k], &recursive_locking);
-  }
-  dt_pthread_mutex_init(&darktable.plugin_threadsafe, NULL);
-  dt_pthread_mutex_init(&darktable.dev_threadsafe, NULL);
-  dt_pthread_mutex_init(&darktable.capabilities_threadsafe, NULL);
-  dt_pthread_mutex_init(&darktable.exiv2_threadsafe, NULL);
-  dt_pthread_mutex_init(&darktable.readFile_mutex, NULL);
-  dt_pthread_mutex_init(&darktable.metadata_threadsafe, NULL);
+    dt_pthread_recursive_mutex_init(&darktable.db_image[k]);
+
+  dt_pthread_mutex_init(&darktable.plugin_threadsafe);
+  dt_pthread_mutex_init(&darktable.dev_threadsafe);
+  dt_pthread_mutex_init(&darktable.capabilities_threadsafe);
+  dt_pthread_mutex_init(&darktable.exiv2_threadsafe);
+  dt_pthread_mutex_init(&darktable.readFile_mutex);
+  dt_pthread_mutex_init(&darktable.metadata_threadsafe);
   darktable.control = calloc(1, sizeof(dt_control_t));
 
   // database
@@ -1015,12 +1087,15 @@ int dt_init(int argc,
   char *tmpdir_from_command = NULL;
   char *configdir_from_command = NULL;
   char *cachedir_from_command = NULL;
+  gboolean print_paths = FALSE;
+  gboolean print_paths_as_flags = FALSE;
 
   darktable.dump_pfm_module = NULL;
   darktable.dump_pfm_pipe = NULL;
   darktable.dump_diff_pipe = NULL;
   darktable.tmp_directory = NULL;
   darktable.bench_module = NULL;
+  darktable.cldiff_stats = FALSE;
 
   int options = DT_OPENCL_OPTION_EXCLUDE;
   gboolean print_statistics = FALSE;
@@ -1094,6 +1169,18 @@ int dt_init(int argc,
       {
         dbfilename_from_command = argv[++k];
         argv[k-1] = NULL;
+        argv[k] = NULL;
+      }
+      else if(!strcmp(argv[k], "--print-paths"))
+      {
+        print_paths = TRUE;
+        print_paths_as_flags = FALSE;
+        argv[k] = NULL;
+      }
+      else if(!strcmp(argv[k], "--print-paths-as-flags"))
+      {
+        print_paths_as_flags = TRUE;
+        print_paths = FALSE;
         argv[k] = NULL;
       }
       else if(!strcmp(argv[k], "--datadir") && argc > k + 1)
@@ -1172,6 +1259,7 @@ int dt_init(int argc,
           !strcmp(darg, "expose") ? DT_DEBUG_EXPOSE :
           !strcmp(darg, "picker") ? DT_DEBUG_PICKER :
           !strcmp(darg, "ai") ? DT_DEBUG_AI : // AI related stuff.
+          !strcmp(darg, "hdr_merge") ? DT_DEBUG_HDR_MERGE : // HDR bracket merge + auto-alignment
           0;
         if(dadd)
           darktable.unmuted |= dadd;
@@ -1335,9 +1423,35 @@ int dt_init(int argc,
 #endif
         argv[k] = NULL;
       }
+      else if(!strcmp(argv[k], "--opencl-tiling"))
+      {
+#ifdef HAVE_OPENCL
+        options |= DT_OPENCL_OPTION_FAST_TILE;
+#endif
+        argv[k] = NULL;
+      }
+      else if(!strcmp(argv[k], "--opencl-no-tiling"))
+      {
+#ifdef HAVE_OPENCL
+        options |= DT_OPENCL_OPTION_NOFAST_TILE;
+#endif
+        argv[k] = NULL;
+      }
+      else if(!strcmp(argv[k], "--opencl-migrate"))
+      {
+#ifdef HAVE_OPENCL
+        options |= DT_OPENCL_OPTION_MIGRATE;
+#endif
+        argv[k] = NULL;
+      }
       else if(!strcmp(argv[k], "--disable-pipecache"))
       {
         darktable.pipe_cache = FALSE;
+        argv[k] = NULL;
+      }
+      else if(!strcmp(argv[k], "--opencl-diffstat"))
+      {
+        darktable.cldiff_stats = TRUE;
         argv[k] = NULL;
       }
       else if(!strcmp(argv[k], "--gimp"))
@@ -1589,8 +1703,63 @@ int dt_init(int argc,
   // darktableconfig.xml.in.
   dt_conf_init(darktable.conf, darktablerc_common, TRUE, config_override);
 
+  if(print_paths || print_paths_as_flags)
+  {
+    // Resolve the same darktablerc-<label>/database-key path real
+    // startup uses below, but before gtk_init()/dt_workspace_create()
+    // ever run - so this needs no display and never shows the
+    // workspace picker. Reports the current default, same as what a
+    // headless darktable-cli run (which skips that GUI code too) would use.
+    const char *dblabel = dt_conf_get_string_const("workspace/label");
+    const gboolean default_dbname = strcmp(dblabel, "") == 0;
+
+    char darktablerc[PATH_MAX] = { 0 };
+    snprintf(darktablerc, sizeof(darktablerc),
+             "%s/darktablerc%s%s", datadir,
+             default_dbname ? "" : "-",
+             default_dbname ? "" : dblabel);
+
+    dt_conf_init(darktable.conf, darktablerc, FALSE, config_override);
+
+    // mirrors the alternative/database-key/:memory:/relative/absolute
+    // resolution in dt_database_init() (database.c), without its
+    // migration and mipmap-cleanup side effects.
+    gchar library_path[PATH_MAX] = { 0 };
+    if(dbfilename_from_command)
+    {
+      g_strlcpy(library_path, dbfilename_from_command, sizeof(library_path));
+    }
+    else
+    {
+      const char *libname = dt_conf_get_string_const("database");
+      if(!libname)
+        snprintf(library_path, sizeof(library_path),
+                 "%s%slibrary.db", datadir, G_DIR_SEPARATOR_S);
+      else if(!strcmp(libname, ":memory:"))
+        g_strlcpy(library_path, libname, sizeof(library_path));
+      else if(libname[0] != '/')
+        snprintf(library_path, sizeof(library_path),
+                 "%s%s%s", datadir, G_DIR_SEPARATOR_S, libname);
+      else
+        g_strlcpy(library_path, libname, sizeof(library_path));
+    }
+    dt_loc_print_paths(stdout, library_path, print_paths_as_flags);
+    // dt_init()'s return value only signals error-vs-continue to its
+    // callers (0 means "keep starting up") - exit directly so we
+    // don't fall through into normal GUI/CLI startup.
+    exit(0);
+  }
+
   // set the interface language and prepare selection for prefs & confgen
   darktable.l10n = dt_l10n_init(init_gui);
+
+#ifdef _WIN32
+  if(_console_notice_requested)
+  {
+    _console_notice_requested = FALSE;
+    _show_console_notice();
+  }
+#endif
 
   gboolean has_workspace = FALSE;
 
@@ -1788,7 +1957,11 @@ int dt_init(int argc,
   GList *changed_xmp_files = NULL;
   if(init_gui)
   {
-    if(dt_conf_get_bool("run_crawler_on_start") && !dt_gimpmode())
+    // when crawling in the background the scan is started once the gui is
+    // up, so nothing happens here and startup is not delayed by it
+    if(dt_conf_get_bool("run_crawler_on_start")
+       && !dt_conf_get_bool("run_crawler_in_background")
+       && !dt_gimpmode())
     {
       dt_splash_screen_allow_create(TRUE); // allow splash screen if a message is to be displayed
       // scan for cases where the database and xmp files have different timestamps
@@ -1963,7 +2136,7 @@ int dt_init(int argc,
   }
 
   dt_splash_screen_set_progress(_("loading image formats"));
- 
+
   darktable.imageio = (dt_imageio_t *)calloc(1, sizeof(dt_imageio_t));
   dt_imageio_init(darktable.imageio);
 
@@ -2075,6 +2248,11 @@ int dt_init(int argc,
         // files are newer than the db entry
         dt_control_crawler_show_image_list(changed_xmp_files);
       }
+
+      // the gui is up, so the crawl can now proceed out of the user's way,
+      // starting with the most recently opened film rolls
+      if(dt_conf_get_bool("run_crawler_in_background"))
+        dt_control_crawler_start_background();
     }
 
     // show the main window and restore its geometry to that saved in the config file
@@ -2103,8 +2281,14 @@ int dt_init(int argc,
   dt_capabilities_add("nonapple");
 #endif
 
+#ifdef HAVE_OPENCV
+  // gates the HDR alignment preferences: without OpenCV the whole merge
+  // auto-alignment path is compiled out, so those prefs are shown greyed out
+  dt_capabilities_add("opencv");
+#endif
+
   dt_print(DT_DEBUG_CONTROL,
-           "[dt_init] startup took %f seconds", dt_get_wtime() - start_wtime);
+           "[dt_init] startup took %f seconds", dt_get_wtime());
 
   dt_print_mem_usage("after successful startup");
 
@@ -2157,6 +2341,8 @@ void dt_cleanup()
   const gboolean init_gui = (darktable.gui != NULL);
 
   dt_stop_backthumbs_crawler(TRUE);
+  // must finish before the database is closed underneath it
+  dt_control_crawler_stop(TRUE);
 
   // last chance to ask user for any input...
 
@@ -2231,6 +2417,7 @@ void dt_cleanup()
     dt_control_cleanup(TRUE);
     dt_undo_cleanup(darktable.undo);
     darktable.undo = NULL;
+    dt_gui_gtk_cleanup(darktable.gui);
     free(darktable.gui);
     darktable.gui = NULL;
   }
@@ -2353,7 +2540,7 @@ void dt_print_ext(const char *msg, ...)
   vsnprintf(vbuf, sizeof(vbuf), msg, ap);
   va_end(ap);
 
-  printf("%11.4f %s\n", dt_get_wtime() - darktable.start_wtime, vbuf);
+  printf("%11.4f %s\n", dt_get_wtime(), vbuf);
   fflush(stdout);
 }
 

@@ -366,14 +366,14 @@ void process(dt_iop_module_t *self,
 
   // we create a raster mask as an example
   float *mask = NULL;
-  if(dt_iop_piece_is_raster_mask_used(piece, mask_id))
+  if(dt_iop_is_raster_mask_used(self, mask_id))
   {
     // Attempt to allocate all of the buffers we need.  For this
     // example, we need one buffer that is equal in dimensions to the
     // output buffer, has one color channel, and has been zero'd.
     // (See common/imagebuf.h for more details on all of the options.)
     if(!dt_iop_alloc_image_buffers
-       (module, roi_in, roi_out,
+       (self, roi_in, roi_out,
         1/*ch per pixel*/ | DT_IMGSZ_OUTPUT | DT_IMGSZ_FULL | DT_IMGSZ_CLEARBUF, &mask,
         0 /* end of list of buffers to allocate */))
     {
@@ -555,14 +555,11 @@ void gui_update(dt_iop_module_t *self)
   dt_iop_useless_params_t *p = self->params;
 
   // introspection based bauhaus widgets, created with
-  // dt_bauhaus_slider_from_params or dt_bauhaus_combobox_from_params,
-  // get updated automatically.
+  // dt_bauhaus_slider_from_params, dt_bauhaus_combobox_from_params or
+  // dt_bauhaus_toggle_from_params, get updated automatically.
   // they cannot use any transformations here (for example *100 for
   // percentages) because that will break enforcement of $MIN/$MAX.
   // Use dt_bauhaus_slider_set_factor/offset in gui_init instead.
-
-  // dt_bauhaus_toggle_from_params creates a standard gtk_toggle_button.
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->check), p->check);
 
   dt_bauhaus_slider_set(g->extra, 0.0f);
 

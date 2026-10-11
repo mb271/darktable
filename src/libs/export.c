@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "common/gdk_event_utils.h"
 
 #include "bauhaus/bauhaus.h"
@@ -567,11 +568,12 @@ static void _scale_changed(GtkEntry *spin,
 static void _width_changed(GtkEditable *entry, gpointer user_data);
 static void _height_changed(GtkEditable *entry, gpointer user_data);
 
-static gboolean _scale_mdlclick(GtkEntry *spin,
-                                GdkEventButton *event,
-                                dt_lib_export_t *d)
+static void _scale_mdlclick_cb(GtkGestureSingle *gesture, int n_press,
+                                  double x, double y,
+                                  dt_lib_export_t *d)
 {
-  if(dt_gdk_event_get_button(event) == GDK_BUTTON_MIDDLE)
+  GtkWidget *spin = dt_gui_get_widget(gesture);
+  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_MIDDLE)
   {
     dt_conf_set_string(CONFIG_PREFIX "resizing_factor", "1");
     g_signal_handlers_block_by_func(spin, _scale_changed, d);
@@ -580,46 +582,44 @@ static gboolean _scale_mdlclick(GtkEntry *spin,
   }
   else
   {
-    _scale_changed(spin, d);
+    _scale_changed(GTK_ENTRY(spin), d);
   }
-  return FALSE;
 }
 
-static gboolean _widht_mdlclick(GtkEntry *spin,
-                                GdkEventButton *event,
-                                gpointer user_data)
+static void _widht_mdlclick_cb(GtkGestureSingle *gesture, int n_press,
+                                  double x, double y,
+                                  dt_lib_export_t *d)
 {
-  if(dt_gdk_event_get_button(event) == GDK_BUTTON_MIDDLE)
+  GtkWidget *spin = dt_gui_get_widget(gesture);
+  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_MIDDLE)
   {
     dt_conf_set_int(CONFIG_PREFIX "width", 0);
-    g_signal_handlers_block_by_func(spin, _width_changed, user_data);
+    g_signal_handlers_block_by_func(spin, _width_changed, d);
     gtk_entry_set_text(GTK_ENTRY(spin), "0");
-    g_signal_handlers_unblock_by_func(spin, _width_changed, user_data);
+    g_signal_handlers_unblock_by_func(spin, _width_changed, d);
   }
   else
   {
-    _width_changed(GTK_EDITABLE(spin), user_data);
+    _width_changed(GTK_EDITABLE(spin), d);
   }
-
-  return FALSE;
 }
 
-static gboolean _height_mdlclick(GtkEntry *spin,
-                                 GdkEventButton *event,
-                                 gpointer user_data)
+static void _height_mdlclick_cb(GtkGestureSingle *gesture, int n_press,
+                                   double x, double y,
+                                   dt_lib_export_t *d)
 {
-  if(dt_gdk_event_get_button(event) == GDK_BUTTON_MIDDLE)
+  GtkWidget *spin = dt_gui_get_widget(gesture);
+  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_MIDDLE)
   {
     dt_conf_set_int(CONFIG_PREFIX "height", 0);
-    g_signal_handlers_block_by_func(spin, _height_changed, user_data);
+    g_signal_handlers_block_by_func(spin, _height_changed, d);
     gtk_entry_set_text(GTK_ENTRY(spin), "0");
-    g_signal_handlers_unblock_by_func(spin, _height_changed, user_data);
+    g_signal_handlers_unblock_by_func(spin, _height_changed, d);
   }
   else
   {
-    _height_changed(GTK_EDITABLE(spin), user_data);
+    _height_changed(GTK_EDITABLE(spin), d);
   }
-  return FALSE;
 }
 
 static void _size_in_px_update(dt_lib_export_t *d)
@@ -1188,27 +1188,22 @@ static void _update_style(const dt_stylemenu_data_t *menu_data)
 static void _apply_style_activate_callback(GtkMenuItem *menuitem,
                                            const dt_stylemenu_data_t *menu_data)
 {
-  GdkEvent *event = gtk_get_current_event();
-  if(event && dt_gdk_event_get_type(event) == GDK_KEY_PRESS)
-  {
+  if(dt_gui_menuitem_activated_by_keyboard(GTK_WIDGET(menuitem)))
     _update_style(menu_data);
-  }
-  gdk_event_free(event);
 }
 
-static gboolean _apply_style_button_callback(GtkMenuItem *menuitem,
-                                             GdkEventButton *event,
-                                             const dt_stylemenu_data_t *menu_data)
+static void _apply_style_button_callback(GtkGestureSingle *gesture,
+                                         gint n_press,
+                                         gdouble x,
+                                         gdouble y,
+                                         const dt_stylemenu_data_t *menu_data)
 {
-  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
-  {
+  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_PRIMARY)
     _update_style(menu_data);
-  }
   else
   {
     //??? dt_shortcut_copy_lua(NULL, name);
   }
-  return FALSE;
 }
 
 static void _style_popupmenu_callback(GtkWidget *w, gpointer user_data)
@@ -1276,8 +1271,11 @@ static void _on_storage_list_changed(gpointer instance,
   dt_bauhaus_combobox_set(d->storage, dt_imageio_get_index_of_storage(storage));
 }
 
-static void _menuitem_preferences(GtkMenuItem *menuitem, dt_lib_module_t *self)
+static void _menuitem_preferences(GSimpleAction *action,
+                                  GVariant *parameter,
+                                  gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_export_t *d = self->data;
   const gchar *name = dt_bauhaus_combobox_get_text(d->storage);
   const gboolean ondisk = name
@@ -1424,12 +1422,12 @@ static void _export_presets_changed_callback(gpointer instance, gpointer module,
     _fill_batch_export_list(self);
 }
 
-void set_preferences(void *menu, dt_lib_module_t *self)
+void set_preferences(GMenu *menu, GActionGroup *action_group, dt_lib_module_t *self)
 {
-  GtkWidget *mi = gtk_menu_item_new_with_label(_("preferences..."));
-  g_signal_connect(G_OBJECT(mi), "activate",
-                   G_CALLBACK(_menuitem_preferences), self);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+  GSimpleAction *action = g_simple_action_new("preferences", NULL);
+  g_signal_connect(action, "activate", G_CALLBACK(_menuitem_preferences), self);
+  g_action_map_add_action(G_ACTION_MAP(action_group), G_ACTION(action));
+  g_menu_append(menu, _("preferences..."), "presets.preferences");
 }
 
 void gui_init(dt_lib_module_t *self)
@@ -1468,8 +1466,8 @@ void gui_init(dt_lib_module_t *self)
   dt_bauhaus_widget_set_label(d->format, NULL, N_("file format"));
   gtk_widget_set_tooltip_markup(GTK_WIDGET(d->format),
     _("images will be exported according to the format specified here\n\n"
-      "when exporting to AVIF, EXR, JPEG XL, or XCF, selecting specific\n"
-      "metadata is not currently possible\n\n"
+      "when exporting to AVIF, EXR, HEIF, JPEG XL, or XCF, selecting\n"
+      "specific metadata is not currently possible\n\n"
       "for these formats, no metadata fields will be included\n"
       "unless the user selects <b>all</b> of the metadata checkboxes in\n"
       "the export module preferences"));
@@ -1652,10 +1650,13 @@ void gui_init(dt_lib_module_t *self)
 
   //  Add style combo
 
-  GtkWidget *styles_button = dtgtk_button_new(dtgtk_cairo_paint_styles, 0, NULL);
+  GtkWidget *styles_button = dtgtk_button_new_full(dtgtk_cairo_paint_styles, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("select style to be applied on export"),
+        .clicked_cb = G_CALLBACK(_style_popupmenu_callback),
+        .clicked_data = (gpointer)d,
+      });
   gtk_widget_set_halign(styles_button,GTK_ALIGN_END);
-  g_signal_connect(G_OBJECT(styles_button), "clicked", G_CALLBACK(_style_popupmenu_callback), (gpointer)d);
-  gtk_widget_set_tooltip_text(styles_button, _("select style to be applied on export"));
 //  dt_gui_add_help_link(styles, "bottom_panel_styles");
   GtkBox *style_box = (GtkBox*)gtk_box_new(GTK_ORIENTATION_HORIZONTAL,0);
   gtk_widget_set_tooltip_text(GTK_WIDGET(style_box), _("temporary style to use while exporting"));
@@ -1737,22 +1738,11 @@ void gui_init(dt_lib_module_t *self)
 
   dt_gui_box_add(d->cs.container, view, d->batch_export_button);
 
-  gtk_widget_add_events(d->width, GDK_BUTTON_PRESS_MASK);
-  gtk_widget_add_events(d->height, GDK_BUTTON_PRESS_MASK);
-  gtk_widget_add_events(d->print_width, GDK_BUTTON_PRESS_MASK);
-  gtk_widget_add_events(d->print_height, GDK_BUTTON_PRESS_MASK);
-  gtk_widget_add_events(d->scale, GDK_BUTTON_PRESS_MASK);
-
-  g_signal_connect(G_OBJECT(d->width), "button-press-event",
-                   G_CALLBACK(_widht_mdlclick), (gpointer)d);
-  g_signal_connect(G_OBJECT(d->height), "button-press-event",
-                   G_CALLBACK(_height_mdlclick), (gpointer)d);
-  g_signal_connect(G_OBJECT(d->print_width), "button-press-event",
-                   G_CALLBACK(_widht_mdlclick), (gpointer)d);
-  g_signal_connect(G_OBJECT(d->print_height), "button-press-event",
-                   G_CALLBACK(_height_mdlclick), (gpointer)d);
-  g_signal_connect(G_OBJECT(d->scale), "button-press-event",
-                   G_CALLBACK(_scale_mdlclick), (gpointer)d);
+  dt_gui_connect_click_all(d->width, _widht_mdlclick_cb, NULL, d);
+  dt_gui_connect_click_all(d->height, _height_mdlclick_cb, NULL, d);
+  dt_gui_connect_click_all(d->print_width, _widht_mdlclick_cb, NULL, d);
+  dt_gui_connect_click_all(d->print_height, _height_mdlclick_cb, NULL, d);
+  dt_gui_connect_click_all(d->scale, _scale_mdlclick_cb, NULL, d);
 
   // this takes care of keeping hidden widgets hidden
   gtk_widget_show_all(self->widget);

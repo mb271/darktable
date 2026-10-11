@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2017-2020 darktable developers.
+    Copyright (C) 2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -18,13 +18,15 @@
 
 #pragma once
 
-#ifdef _WIN32
-char *strptime(const char *buf, const char *format, struct tm *tm);
-#endif
+#include <json-glib/json-glib.h>
 
-// clang-format off
-// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
-// vim: shiftwidth=2 expandtab tabstop=2 cindent
-// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
-// clang-format on
+/** load tool metadata (name/description/inputSchema) from a JSON file; returns
+    the number of tools, or -1 if the file is missing or not a JSON array */
+int mcp_tools_load(const char *path);
 
+/** JSON array of tool descriptors for a `tools/list` result (caller owns it) */
+JsonNode *mcp_tools_list_node(void);
+
+/** dispatch a `tools/call`, returning an MCP tool result { content, isError }
+    if `name` is unknown, sets *found = FALSE and returns NULL */
+JsonNode *mcp_tools_call_node(const char *name, JsonObject *arguments, gboolean *found);

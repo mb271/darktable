@@ -1,6 +1,6 @@
 /*
   This file is part of darktable,
-  Copyright (C) 2009-2025 darktable developers.
+  Copyright (C) 2009-2026 darktable developers.
 
   darktable is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -16,6 +16,7 @@
   along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "common/dtdata.h"
 #include "common/image.h"
 #include "common/collection.h"
 #include "common/colorspaces.h"
@@ -42,16 +43,18 @@
 #include "imageio/imageio_rawspeed.h"
 #include "imageio/imageio_libraw.h"
 #include "win/filepath.h"
+
 #ifdef USE_LUA
 #include "lua/image.h"
 #endif
-#include <assert.h>
+
 #include <ctype.h>
 #include <math.h>
 #include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
 #ifndef _WIN32
 #include <glob.h>
 #endif
@@ -149,6 +152,11 @@ gboolean dt_image_is_ldr(const dt_image_t *img)
             || !strcasecmp(c, ".jpg")
             || !strcasecmp(c, ".webp")
             || !strcasecmp(c, ".ppm"));
+}
+
+gboolean dt_image_is_ai_denoised(const dt_image_t *img)
+{
+  return img && (img->flags & DT_IMAGE_AI_DENOISED);
 }
 
 gboolean dt_image_is_hdr(const dt_image_t *img)
@@ -1829,7 +1837,8 @@ static dt_imgid_t _image_import_internal(const dt_filmid_t film_id,
     ;
   if(!strcasecmp(cc, ".dt")
      || !strcasecmp(cc, ".dttags")
-     || !strcasecmp(cc, ".xmp"))
+     || !strcasecmp(cc, ".xmp")
+     || !strcasecmp(cc, DT_DTDATA_EXT))
   {
     g_free(normalized_filename);
     return NO_IMGID;
@@ -1874,8 +1883,13 @@ static dt_imgid_t _image_import_internal(const dt_filmid_t film_id,
     if(img)
       img->flags &= ~DT_IMAGE_REMOVE;
     dt_image_cache_write_release(img, DT_IMAGE_CACHE_RELAXED);
-    _image_read_duplicates(id, normalized_filename, raise_signals);
-    dt_image_synch_all_xmp(normalized_filename);
+    // Reconcile with XMP sidecars unless library history is preferred to avoid
+    // overwriting library edit history with potentially stale XMP history.
+    if(!darktable.prefer_library_history)
+    {
+      _image_read_duplicates(id, normalized_filename, raise_signals);
+      dt_image_synch_all_xmp(normalized_filename);
+    }
     g_free(ext);
     g_free(normalized_filename);
     if(raise_signals)
@@ -2230,6 +2244,10 @@ void dt_image_init(dt_image_t *img)
   for(uint8_t i = 0; i < 4; i++) img->raw_black_level_separate[i] = 0;
   img->raw_white_point = 16384; // 2^14
   dt_mark_colormatrix_invalid(&img->d65_color_matrix[0]);
+  dt_mark_colormatrix_invalid(&img->dng_forward_matrix[0]);
+  // initialization also accepts uninitialized structs; owners must free existing tables first
+  img->profile_hsm_data = NULL;
+  img->profile_hsm_data_size = img->profile_hsm_hue_div = img->profile_hsm_sat_div = img->profile_hsm_val_div = img->profile_hsm_encoding = 0;
   img->profile = NULL;
   img->profile_size = 0;
   img->colorspace = DT_IMAGE_COLORSPACE_NONE;
@@ -2242,9 +2260,12 @@ void dt_image_init(dt_image_t *img)
   img->wb_coeffs[3] = NAN;
   img->usercrop[0] = img->usercrop[1] = 0;
   img->usercrop[2] = img->usercrop[3] = 1;
+  img->camera_ratio_d = img->camera_ratio_n = 0;
   img->dng_gain_maps = NULL;
+  img->dng_gain_maps_opcode3 = NULL;
   img->exif_correction_type = CORRECTION_TYPE_NONE;
   memset(&img->exif_correction_data, 0, sizeof(img->exif_correction_data));
+  img->exif_shading_compensation = FALSE;
   img->cache_entry = 0;
 
   for(int k=0; k<4; k++)
@@ -2371,7 +2392,7 @@ gboolean dt_image_rename(const dt_imgid_t imgid,
          -1, &duplicates_stmt, NULL);
       // clang-format on
 
-      // first move xmp files of image and duplicates
+      // first move xmp and .dtdata files of image and duplicates
       GList *dup_list = NULL;
       DT_DEBUG_SQLITE3_BIND_INT(duplicates_stmt, 1, imgid);
       while(sqlite3_step(duplicates_stmt) == SQLITE_ROW)
@@ -2383,16 +2404,50 @@ gboolean dt_image_rename(const dt_imgid_t imgid,
         g_strlcpy(newxmp, newimg, sizeof(newxmp));
         dt_image_path_append_version(id, oldxmp, sizeof(oldxmp));
         dt_image_path_append_version(id, newxmp, sizeof(newxmp));
+        // the .dtdata sidecar follows the xmp wherever it goes
+        gchar olddata[PATH_MAX] = { 0 }, newdata[PATH_MAX] = { 0 };
+        dt_dtdata_path_for_image(oldxmp, olddata, sizeof(olddata));
+        dt_dtdata_path_for_image(newxmp, newdata, sizeof(newdata));
         g_strlcat(oldxmp, ".xmp", sizeof(oldxmp));
         g_strlcat(newxmp, ".xmp", sizeof(newxmp));
 
         GFile *goldxmp = g_file_new_for_path(oldxmp);
         GFile *gnewxmp = g_file_new_for_path(newxmp);
+        GError *error = NULL;
 
-        g_file_move(goldxmp, gnewxmp, 0, NULL, NULL, NULL, NULL);
+        // no xmp yet (lazy or disabled sidecars) is not a failure
+        if(g_file_test(oldxmp, G_FILE_TEST_EXISTS)
+           && !g_file_move(goldxmp, gnewxmp, 0, NULL, NULL, NULL, &error))
+        {
+          dt_print(DT_DEBUG_ALWAYS, "[dt_image_rename] cannot move '%s' to '%s': %s",
+                   oldxmp, newxmp, error ? error->message : "unknown error");
+          g_clear_error(&error);
+        }
 
         g_object_unref(goldxmp);
         g_object_unref(gnewxmp);
+
+        // moved even if the xmp was not: the xmp is rewritten from the
+        // database, the masks in the sidecar exist nowhere else
+        if(g_file_test(olddata, G_FILE_TEST_EXISTS))
+        {
+          GFile *golddata = g_file_new_for_path(olddata);
+          GFile *gnewdata = g_file_new_for_path(newdata);
+          // a stale sidecar at the destination must not keep the live one behind.
+          // the masks exist nowhere else, so a locked source is copied instead
+          if(!g_file_move(golddata, gnewdata, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &error))
+          {
+            g_clear_error(&error);
+            if(!g_file_copy(golddata, gnewdata, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &error))
+            {
+              dt_print(DT_DEBUG_ALWAYS, "[dt_image_rename] cannot move or copy '%s' to '%s': %s",
+                       olddata, newdata, error ? error->message : "unknown error");
+              g_clear_error(&error);
+            }
+          }
+          g_object_unref(golddata);
+          g_object_unref(gnewdata);
+        }
       }
       sqlite3_finalize(duplicates_stmt);
 
@@ -2413,6 +2468,7 @@ gboolean dt_image_rename(const dt_imgid_t imgid,
         }
         // write through to db, but not to xmp
         dt_image_cache_write_release(img, DT_IMAGE_CACHE_RELAXED);
+        DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
         dup_list = g_list_delete_link(dup_list, dup_list);
         // now also write xmp file
         dt_image_synch_xmp(id);
@@ -2847,6 +2903,30 @@ gboolean dt_image_local_copy_set(const dt_imgid_t imgid)
     g_object_unref(src);
   }
 
+  // the sidecar travels with the copy so masks stay readable while the
+  // original is offline; dt_image_local_copy_reset() merges it back. each
+  // duplicate has its own, hence outside the raw copy above
+  gchar srcdata[PATH_MAX] = { 0 };
+  gchar destdata[PATH_MAX] = { 0 };
+  dt_image_path_append_version(imgid, srcpath, sizeof(srcpath));
+  dt_image_path_append_version(imgid, destpath, sizeof(destpath));
+  dt_dtdata_path_for_image(srcpath, srcdata, sizeof(srcdata));
+  dt_dtdata_path_for_image(destpath, destdata, sizeof(destdata));
+  if(g_file_test(srcdata, G_FILE_TEST_EXISTS))
+  {
+    GFile *src = g_file_new_for_path(srcdata);
+    GFile *dest = g_file_new_for_path(destdata);
+    GError *gerror = NULL;
+    if(!g_file_copy(src, dest, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &gerror))
+    {
+      dt_print(DT_DEBUG_ALWAYS, "[dt_image_local_copy_set] cannot copy '%s' to '%s': %s",
+               srcdata, destdata, gerror ? gerror->message : "");
+      g_clear_error(&gerror);
+    }
+    g_object_unref(dest);
+    g_object_unref(src);
+  }
+
   // update cache local copy flags, do this even if the local copy
   // already exists as we need to set the flags for duplicate
   dt_image_t *img = dt_image_cache_get(imgid, 'w');
@@ -2931,6 +3011,25 @@ gboolean dt_image_local_copy_reset(const dt_imgid_t imgid)
 
   if(g_file_test(locppath, G_FILE_TEST_EXISTS) && strstr(locppath, cachedir))
   {
+    // masks imported while the original was offline live only in the cache
+    // sidecar: fold them into the original's before anything is deleted,
+    // and keep the local copy whole if that fails so it can be retried
+    gchar locbase[PATH_MAX] = { 0 }, locdata[PATH_MAX] = { 0 };
+    gchar origbase[PATH_MAX] = { 0 }, origdata[PATH_MAX] = { 0 };
+    g_strlcpy(locbase, locppath, sizeof(locbase));
+    g_strlcpy(origbase, destpath, sizeof(origbase));
+    dt_image_path_append_version(imgid, locbase, sizeof(locbase));
+    dt_image_path_append_version(imgid, origbase, sizeof(origbase));
+    dt_dtdata_path_for_image(locbase, locdata, sizeof(locdata));
+    dt_dtdata_path_for_image(origbase, origdata, sizeof(origdata));
+    if(!dt_dtdata_file_merge(locdata, origdata))
+    {
+      dt_print(DT_DEBUG_ALWAYS, "[dt_image_local_copy_reset] cannot merge '%s' into '%s'",
+               locdata, origdata);
+      dt_control_log(_("cannot remove local copy: its raster masks could not be merged back"));
+      return TRUE;
+    }
+
     GFile *dest = g_file_new_for_path(locppath);
 
     // first sync the xmp with the original picture
@@ -2944,12 +3043,16 @@ gboolean dt_image_local_copy_reset(const dt_imgid_t imgid)
 
     g_object_unref(dest);
 
-    // delete xmp if any
+    // delete xmp and .dtdata if any
     dt_image_path_append_version(imgid, locppath, sizeof(locppath));
     g_strlcat(locppath, ".xmp", sizeof(locppath));
     dest = g_file_new_for_path(locppath);
 
     if(g_file_test(locppath, G_FILE_TEST_EXISTS)) g_file_delete(dest, NULL, NULL);
+    g_object_unref(dest);
+
+    dest = g_file_new_for_path(locdata);
+    if(g_file_test(locdata, G_FILE_TEST_EXISTS)) g_file_delete(dest, NULL, NULL);
     g_object_unref(dest);
   }
 

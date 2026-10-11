@@ -355,18 +355,25 @@ static size_t _get_post_operations(const dt_develop_blend_params_t *const bp,
   return index;
 }
 
-static inline int _get_required_w(const float radius, const float scale)
+/** Restrict the maximum window width to size of provided data.
+    Anything larger is just more maths without output difference.
+    Using sqrtf(scale) is a better approach to decrease perceived
+    differences (both in darkroom and when exporting in non HQ mode.
+*/
+static inline int _required_w(const float radius, const float scale, const int maxdim)
 {
-  return MAX(1, (int)(2.0f * radius * scale + 0.5f));
+  return MIN(maxdim, MAX(1, (int)ceilf(2.0f * radius * sqrtf(scale))));
 }
 
 /* Reminder: stability of the feathering guide filter depends on input data range
    and signal but also on the chose weight and eps.
 */
 
+// feather_version comes from the piece: the module's blend params are rewritten
+// with the defaults while another pipe replays history
 static float _get_guide_weight(const dt_dev_pixelpipe_iop_t *piece)
 {
-  const uint32_t fmode = piece->module->blend_params->feather_version;
+  const uint32_t fmode = ((const dt_develop_blend_params_t *)piece->blendop_data)->feather_version;
   const dt_iop_colorspace_type_t cst = dt_develop_blend_colorspace(piece, IOP_CS_NONE);
   if(cst == IOP_CS_RGB)
     return (fmode == 0) ? 100.0f : 10.0f;
@@ -376,10 +383,25 @@ static float _get_guide_weight(const dt_dev_pixelpipe_iop_t *piece)
 
 static float _get_feathering_eps(const dt_dev_pixelpipe_iop_t *piece)
 {
-  const uint32_t fmode = piece->module->blend_params->feather_version;
+  const uint32_t fmode = ((const dt_develop_blend_params_t *)piece->blendop_data)->feather_version;
   const dt_iop_colorspace_type_t cst = dt_develop_blend_colorspace(piece, IOP_CS_NONE);
 
   return (cst == IOP_CS_RGB && fmode) ? 0.5f : 1.0f;
+}
+
+// resolved from the piece, like feather_version: the module's raster_mask.sink
+// is cleared while another pipe replays history
+static const dt_iop_module_t *_raster_source(const dt_dev_pixelpipe_iop_t *piece)
+{
+  const dt_develop_blend_params_t *const d = piece->blendop_data;
+  for(const GList *n = piece->pipe->nodes; n; n = g_list_next(n))
+  {
+    const dt_iop_module_t *candidate = ((dt_dev_pixelpipe_iop_t *)n->data)->module;
+    if(dt_iop_module_is(candidate, d->raster_mask_source)
+       && candidate->multi_priority == d->raster_mask_instance)
+      return candidate;
+  }
+  return NULL;
 }
 
 static void _develop_blend_process_feather(const float *const guide,
@@ -392,7 +414,7 @@ static void _develop_blend_process_feather(const float *const guide,
                                            const float scale,
                                            const float sqrt_eps)
 {
-  const int w = _get_required_w(feathering_radius, scale);
+  const int w = _required_w(feathering_radius, scale, (int)MAX(width, height));
 
   float *const restrict mask_bak = dt_alloc_align_float(width * height);
   if(mask_bak)
@@ -436,7 +458,7 @@ static void _develop_blend_process_mask_tone_curve(float *const restrict mask,
     /*  we don't want *very* small masking values possibly resulting from above maths
         so we make sure they above a threshold
     */
-    const float mval = cval > 1e-6 ? cval : 0.0f;
+    const float mval = cval > 1e-6f ? cval : 0.0f;
     mask[k] = CLIP(mval) * opacity;
   }
 }
@@ -452,6 +474,74 @@ static const char *_develop_blend_colorspace_to_str(const dt_develop_blend_color
     case DEVELOP_BLEND_CS_RGB_SCENE:    return "BLEND_CS_RGB_SCENE";
     default:                            return "invalid BLEND_CS";
   }
+}
+
+// Rasterize the module's drawn mask group into `mask`, reusing a previously
+// rasterized result when nothing it depends on changed. This spares the (often
+// expensive) group rasterization when the module reprocesses with an unchanged
+// mask -- e.g. while the mask overlay is shown (pipe cache disabled downstream
+// of focus) or when a non-mask slider on a masked module moves.
+//
+// Shared by the CPU and OpenCL blend paths: the group renderer runs on the host
+// in both, so a cached buffer is valid for either, and going through one
+// function is what keeps the two from drifting apart.
+static gboolean _render_drawn_mask_cached(dt_iop_module_t *self,
+                                          dt_dev_pixelpipe_iop_t *piece,
+                                          dt_masks_form_t *form,
+                                          const dt_iop_roi_t *const roi_in,
+                                          const dt_iop_roi_t *const roi_out,
+                                          const int devid,
+                                          float *const mask)
+{
+  const dt_develop_blend_params_t *const d = piece->blendop_data;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+
+  dt_dev_distorted_mask_cache_t *const mc = &piece->drawn_mask_cache;
+  // hash against the pipe's own form list, not darktable.develop's. The
+  // rendered mask is built from piece->pipe->forms (see the lookup above), so
+  // that is what the key has to describe. Resolving members through the
+  // global instead is silently lossy wherever the two differ -- a headless
+  // run (no develop at all), a second-window pinned dev, an export of an
+  // image other than the one open in the darkroom: an unresolvable member
+  // contributes NOTHING to the hash, which then collapses to the group's own
+  // type/formid/version/source and stops changing when the mask does.
+  dt_hash_t mkey = dt_masks_group_hash_ext(DT_INITHASH, form, piece->pipe->forms);
+  mkey = dt_hash(mkey, roi_out, sizeof(dt_iop_roi_t));
+  mkey = dt_hash(mkey, &d->mask_mode, sizeof(d->mask_mode));
+
+  if(mc->data && mkey != DT_INVALID_HASH
+     && mc->hash == mkey
+     && mc->roi.width == owidth && mc->roi.height == oheight)
+  {
+    memcpy(mask, mc->data, sizeof(float) * (size_t)owidth * oheight);
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE, "drawn mask cache hit",
+                  piece->pipe, self, devid, roi_in, roi_out);
+    return TRUE;
+  }
+
+  const gboolean form_ok = dt_masks_group_render_roi(self, piece, form, roi_out, mask);
+  if(form_ok)
+  {
+    // through the pipe's own allocator, so this buffer is counted in
+    // pipe->mask_cache_size and honours the low-memory opt-out the detail and
+    // raster caches already obey: it survives synch_all, so unlike them it is
+    // held for as long as the mask is unchanged
+    if(dt_dev_pixelpipe_prepare_mask_cache(piece, mc, (size_t)owidth * oheight))
+    {
+      memcpy(mc->data, mask, sizeof(float) * (size_t)owidth * oheight);
+      mc->roi = *roi_out;
+      mc->hash = mkey;
+    }
+    else
+      mc->hash = DT_INVALID_HASH;
+  }
+  else if(mc->data)
+  {
+    dt_dev_pixelpipe_clear_mask_cache(piece->pipe, mc);
+  }
+
+  return form_ok;
 }
 
 /* we test in pixelpipe processing if this required */
@@ -554,8 +644,8 @@ void dt_develop_blend_process(dt_iop_module_t *self,
     */
     gboolean free_mask;
     float *raster_mask = dt_dev_get_raster_mask(piece,
-                                                self->raster_mask.sink.source,
-                                                self->raster_mask.sink.id,
+                                                _raster_source(piece),
+                                                d->raster_mask_id,
                                                 self, &free_mask);
     if(raster_mask)
     {
@@ -597,7 +687,8 @@ void dt_develop_blend_process(dt_iop_module_t *self,
     // we blend with a drawn and/or parametric mask
     if(form && mode_drawn && !(self->flags() & IOP_FLAGS_NO_MASKS))
     {
-      form_ok = dt_masks_group_render_roi(self, piece, form, roi_out, mask);
+      form_ok = _render_drawn_mask_cached(self, piece, form, roi_in, roi_out,
+                                         DT_DEVICE_CPU, mask);
 
       if(inverted)
       {
@@ -762,8 +853,7 @@ void dt_develop_blend_process(dt_iop_module_t *self,
   }
 
   // check if we should store the mask for export or use in subsequent modules
-  // TODO: should we skip raster masks?
-  if(dt_iop_piece_is_raster_mask_used(piece, BLEND_RASTER_ID))
+  if(dt_iop_is_raster_mask_stored(piece, BLEND_RASTER_ID))
     dt_iop_piece_set_raster(piece, _mask, roi_in, roi_out);
   else
     dt_iop_piece_clear_raster(piece, _mask);
@@ -1053,8 +1143,8 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
     */
     gboolean free_mask;
     float *raster_mask = dt_dev_get_raster_mask(piece,
-                                                self->raster_mask.sink.source,
-                                                self->raster_mask.sink.id,
+                                                _raster_source(piece),
+                                                d->raster_mask_id,
                                                 self,
                                                 &free_mask);
     if(raster_mask)
@@ -1099,7 +1189,11 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
     // we blend with a drawn and/or parametric mask
     if(form && mode_drawn && !(self->flags() & IOP_FLAGS_NO_MASKS))
     {
-      form_ok = dt_masks_group_render_roi(self, piece, form, roi_out, mask);
+      // same memoized rasterization as the CPU path: the group renderer runs on
+      // the host here too, so a cached buffer is equally valid, and sharing the
+      // function is what keeps the two paths from producing different masks
+      form_ok = _render_drawn_mask_cached(self, piece, form, roi_in, roi_out,
+                                         devid, mask);
 
       if(inverted)
       {
@@ -1166,7 +1260,9 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
   if(!uniform && post_operations_size)
   {
     // post processing the mask (it will always be stored in dev_mask)
-    const int featherw = _get_required_w(d->feathering_radius, roi_out->scale / piece->iscale);
+    const int featherw = _required_w(d->feathering_radius,
+                                     roi_out->scale / piece->iscale,
+                                     MAX(owidth, oheight));
     const float sqrt_eps = _get_feathering_eps(piece);
     const float guide_weight = _get_guide_weight(piece);
 
@@ -1325,18 +1421,17 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
   }
 
   // check if we should store the mask for export or use in subsequent modules
-  // TODO: should we skip raster masks?
-  if(dt_iop_piece_is_raster_mask_used(piece, BLEND_RASTER_ID))
+  if(dt_iop_is_raster_mask_stored(piece, BLEND_RASTER_ID))
   {
-    // get back final mask from the device as the raster mask
-    if(!raster)
+    // Get back the final mask from the device as the raster mask.
+    //
+    // This must be done unconditionally to avoid presenting downstream a different
+    // mask than the CPU one in the presence of refinements.
+    err = dt_opencl_copy_image_to_host(devid, mask, dev_mask, owidth, oheight, sizeof(float));
+    if(err != CL_SUCCESS)
     {
-      err = dt_opencl_copy_image_to_host(devid, mask, dev_mask, owidth, oheight, sizeof(float));
-      if(err != CL_SUCCESS)
-      {
-        dt_iop_piece_clear_raster(piece, _mask);
-        goto error;
-      }
+      dt_iop_piece_clear_raster(piece, _mask);
+      goto error;
     }
     dt_iop_piece_set_raster(piece, mask, roi_in, roi_out);
   }

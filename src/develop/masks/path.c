@@ -27,6 +27,7 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/openmp_maths.h"
+
 #include <assert.h>
 
 // Per-form grow/shrink state. Every grow/shrink (whether from the scroll wheel
@@ -42,9 +43,11 @@ typedef struct
   GHashTable *results; // key: quantized signed offset px → GList* (deep copy)
   float offset_px;     // signed offset currently applied to the baseline
 } _resize_state_t;
+
 // Cache key quantization: 1/16 image-pixel buckets (offsets are integer px or a
 // percentage of a fixed baseline, so this never collides distinct requests).
 #define RESIZE_KEY_Q 16.0f
+
 // Accessed only from GUI-thread scroll/button/slider events — no mutex needed.
 static GHashTable *_resize_states = NULL;
 
@@ -140,7 +143,7 @@ static void _path_get_XY(const float p0x,
  * @param seg_start segment start data, 7 floats:
  *                  [0..1] corner XY, [2..3] outgoing ctrl XY,
  *                  [4] signed border radius,
- *                  [5..6] smoothed unit tangent (0,0 if unset)
+ *                  [5..6] smoothed unit tangent (0,0 if unset or rejected)
  * @param seg_end   segment end data, same layout (with incoming ctrl at [2..3])
  * @param t         position on the segment, between 0 and 1
  * @param rad       border radius at t (interpolated from the two endpoint radii)
@@ -826,7 +829,7 @@ static void _path_points_fill_border_gaps(float *cmax,
 
   // remember the indexes of the points we add
   const int start_pt_index = dt_masks_dynbuf_position(dpoints)/2;
-  dt_masks_intbuf_add2(fill_seg_indexes, start_pt_index, start_pt_index + 2*(l-1));
+  dt_masks_intbuf_add_2(fill_seg_indexes, start_pt_index, start_pt_index + 2*(l-1));
 
   // allocate entries in the dynbufs
   float *dpoints_ptr = dt_masks_dynbuf_reserve_n(dpoints, 2*(l-1));
@@ -1452,7 +1455,7 @@ static int _path_find_self_intersection(dt_masks_dynbuf_t *inter,
 /** this take care of gaps and self-intersection and iop distortions */
 static int _path_get_pts_border(dt_develop_t *dev,
                                 dt_masks_form_t *form,
-                                const double iop_order,
+                                const int iop_order,
                                 const int transf_direction,
                                 dt_dev_pixelpipe_t *pipe,
                                 float **points,
@@ -1557,7 +1560,23 @@ static int _path_get_pts_border(dt_develop_t *dev,
           const float tx = corner_xy[kn * 2]     - corner_xy[kp * 2];
           const float ty = corner_xy[kn * 2 + 1] - corner_xy[kp * 2 + 1];
           const float len = sqrtf(tx * tx + ty * ty);
-          if(len > 0.0f)
+
+          // the wide chord is only a valid tangent while it still points the
+          // way the path locally runs. Across a spike or notch narrower than
+          // 2N corners it spans the whole feature instead, and its normal
+          // then falls on the inside of one flank, dragging the border into
+          // the shape. Compare it with the immediate chord and drop it there;
+          // the segment falls back to the exact derivative in
+          // _path_border_get_XY, which is what happened before smoothing.
+          const int kp1 = (k - 1 + (int)nb) % (int)nb;
+          const int kn1 = (k + 1) % (int)nb;
+          const float lx = corner_xy[kn1 * 2]     - corner_xy[kp1 * 2];
+          const float ly = corner_xy[kn1 * 2 + 1] - corner_xy[kp1 * 2 + 1];
+          const float llen = sqrtf(lx * lx + ly * ly);
+          const gboolean agrees = len > 0.0f && llen > 0.0f
+            && (tx * lx + ty * ly) / (len * llen) >= 0.5f;  // within ~60 degrees
+
+          if(agrees)
           {
             smoothed_tangents[k * 2]     = tx / len;
             smoothed_tangents[k * 2 + 1] = ty / len;
@@ -2020,7 +2039,7 @@ static int _path_get_points_border(dt_develop_t *dev,
                                    const dt_iop_module_t *module)
 {
   if(source && !module) return 0;
-  const double ioporder = (module) ? module->iop_order : 0.0f;
+  const int ioporder = (module) ? module->iop_order : 0;
   return _path_get_pts_border(dev, form, ioporder,
                               DT_DEV_TRANSFORM_DIR_ALL, dev->preview_pipe, points,
                               points_count, border, border_count, source);
@@ -2381,12 +2400,36 @@ static float _path_resize_offset_px(
   return _path_offset_px(points, iwidth, iheight, resize_amount, pct);
 }
 
+// Raster canvas the grow/shrink pipeline works on. It is anchored on the shape,
+// not on the image: `x0`/`y0` are the canvas origin in image pixels and `scale`
+// converts image pixels to raster pixels. The canvas is padded well beyond the
+// shape so a grow never runs into its edge (which would flatten the outline
+// along the border instead of letting it expand off-canvas).
+typedef struct _path_canvas_t
+{
+  int rw, rh;   // raster size in pixels
+  float x0, y0; // canvas origin in image pixels (may be negative)
+  float scale;  // image px → raster px
+  float iw, ih; // image size in pixels, for the normalized ↔ image mapping
+} _path_canvas_t;
+
+// normalized mask coords → raster pixel coords
+static inline float _canvas_x(const _path_canvas_t *c, const float nx)
+{
+  return (nx * c->iw - c->x0) * c->scale;
+}
+static inline float _canvas_y(const _path_canvas_t *c, const float ny)
+{
+  return (ny * c->ih - c->y0) * c->scale;
+}
+
 // Rasterize the closed bezier path into a binary float mask following the
 // ras2forms convention: value < 0.5 → inside, value >= 0.5 → outside.
 // Returns a buffer owned by the caller (dt_free_align), or NULL on allocation
 // failure.
-static float *_path_rasterize(dt_masks_form_t *form, const int rw, const int rh)
+static float *_path_rasterize(dt_masks_form_t *form, const _path_canvas_t *c)
 {
+  const int rw = c->rw, rh = c->rh;
   // Render the path as alpha=1 on a cleared A8 surface, then invert.
   cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_A8, rw, rh);
   cairo_t *cr2 = cairo_create(surf);
@@ -2400,19 +2443,19 @@ static float *_path_rasterize(dt_masks_form_t *form, const int rw, const int rh)
   {
     const GList *seg = form->points;
     const dt_masks_point_path_t *first = seg->data;
-    cairo_move_to(cr2, first->corner[0] * rw, first->corner[1] * rh);
+    cairo_move_to(cr2, _canvas_x(c, first->corner[0]), _canvas_y(c, first->corner[1]));
     for(; seg; seg = g_list_next(seg))
     {
       const dt_masks_point_path_t *a = seg->data;
       const GList *seg2 = g_list_next_wraparound(seg, form->points);
       const dt_masks_point_path_t *b = seg2->data;
       cairo_curve_to(cr2,
-                     a->ctrl2[0] * rw,
-                     a->ctrl2[1] * rh,
-                     b->ctrl1[0] * rw,
-                     b->ctrl1[1] * rh,
-                     b->corner[0] * rw,
-                     b->corner[1] * rh);
+                     _canvas_x(c, a->ctrl2[0]),
+                     _canvas_y(c, a->ctrl2[1]),
+                     _canvas_x(c, b->ctrl1[0]),
+                     _canvas_y(c, b->ctrl1[1]),
+                     _canvas_x(c, b->corner[0]),
+                     _canvas_y(c, b->corner[1]));
     }
   }
   cairo_close_path(cr2);
@@ -2623,12 +2666,12 @@ static GList *_path_simplify_rdp(GList *points, const double eps_px)
 // Returns a newly-owned points list (caller frees), or NULL if no usable
 // boundary was produced. Does not free `morphed`.
 static GList *_path_revectorize(float *morphed,
-                                const int rw,
-                                const int rh,
+                                const _path_canvas_t *c,
                                 const double alphamax,
                                 const double eps_px,
                                 const float mean_border)
 {
+  const int rw = c->rw, rh = c->rh;
   // out_signs runs parallel to new_forms: '+' for outer boundaries, '-' for
   // holes. A hole can have more nodes than the outer contour, so select on the
   // sign first and only use node count as a tie-breaker among outer boundaries.
@@ -2671,17 +2714,21 @@ static GList *_path_revectorize(float *morphed,
   // the resized shape preserves the original's corners instead of rounding them.
   best->points = _path_simplify_rdp(best->points, eps_px);
 
-  // ras2forms (image=NULL) returns raw pixel coords [0..rw]×[0..rh];
-  // mask coords are normalized: corner[0] ∈ [0,1] = pixel_x / rw.
+  // ras2forms (image=NULL) returns raw pixel coords [0..rw]×[0..rh] on the
+  // shape-anchored canvas; map them back through the canvas origin/scale into
+  // normalized mask coords. Results outside [0,1] are legitimate: that is a
+  // shape which has grown past the image border.
+  const float ux = 1.0f / (c->scale * c->iw), uy = 1.0f / (c->scale * c->ih);
+  const float nx0 = c->x0 / c->iw, ny0 = c->y0 / c->ih;
   for(GList *pl = best->points; pl; pl = g_list_next(pl))
   {
     dt_masks_point_path_t *pt = pl->data;
-    pt->corner[0] /= rw;
-    pt->corner[1] /= rh;
-    pt->ctrl1[0] /= rw;
-    pt->ctrl1[1] /= rh;
-    pt->ctrl2[0] /= rw;
-    pt->ctrl2[1] /= rh;
+    pt->corner[0] = pt->corner[0] * ux + nx0;
+    pt->corner[1] = pt->corner[1] * uy + ny0;
+    pt->ctrl1[0] = pt->ctrl1[0] * ux + nx0;
+    pt->ctrl1[1] = pt->ctrl1[1] * uy + ny0;
+    pt->ctrl2[0] = pt->ctrl2[0] * ux + nx0;
+    pt->ctrl2[1] = pt->ctrl2[1] * uy + ny0;
     pt->border[0] = pt->border[1] = mean_border;
   }
 
@@ -2707,19 +2754,66 @@ static gboolean _path_morph_core(dt_masks_form_t *form, const float offset_img_p
   if(iwidth <= 0.0f || iheight <= 0.0f)
     return FALSE;
 
-  // Raster resolution and the offset radius (in raster pixels).
+  // The raster canvas is anchored on the shape's own bounding box, not on the
+  // image: rasterizing on an image-sized canvas would clip everything growing
+  // past the border and re-vectorize it as a straight line along that border.
+  // Pad the box by the grow offset plus some slack, so the morphed outline is
+  // always surrounded by empty canvas and off-image parts survive intact.
+  _path_init_ctrl_points(form); // ctrl points take part in the bbox
+  const dt_masks_point_path_t *bfirst = form->points->data;
+  float bbx0 = bfirst->corner[0], bbx1 = bfirst->corner[0];
+  float bby0 = bfirst->corner[1], bby1 = bfirst->corner[1];
+  for(const GList *pl = form->points; pl; pl = g_list_next(pl))
+  {
+    const dt_masks_point_path_t *p = pl->data;
+    const float xs[3] = { p->corner[0], p->ctrl1[0], p->ctrl2[0] };
+    const float ys[3] = { p->corner[1], p->ctrl1[1], p->ctrl2[1] };
+    for(int k = 0; k < 3; k++)
+    {
+      bbx0 = fminf(bbx0, xs[k]);
+      bbx1 = fmaxf(bbx1, xs[k]);
+      bby0 = fminf(bby0, ys[k]);
+      bby1 = fmaxf(bby1, ys[k]);
+    }
+  }
+
+  // bbox in image pixels, padded by the offset (only a grow needs the room, but
+  // padding a shrink too costs nothing and keeps the mapping uniform) plus a
+  // slack margin that guarantees a few empty pixels around the traced boundary.
+  const float bw_img = fmaxf(1.0f, (bbx1 - bbx0) * iwidth);
+  const float bh_img = fmaxf(1.0f, (bby1 - bby0) * iheight);
+  const float pad_img = fmaxf(offset_img_px, 0.0f) + fmaxf(2.0f, 0.02f * fmaxf(bw_img, bh_img));
+  const float cw_img = bw_img + 2.0f * pad_img;
+  const float ch_img = bh_img + 2.0f * pad_img;
+
+  // Raster resolution and the offset radius (in raster pixels). The tracing
+  // resolution applies to the padded canvas, so the raster cost stays constant
+  // no matter how far the shape extends beyond the image.
   const char *res_str = dt_conf_get_string_const("masks/path_resize_resolution");
   const int res_pref = res_str ? atoi(res_str) : 0;
   const int trace_res = (res_pref > 0) ? res_pref : 2048;
-  const float rscale = (float)trace_res / fmaxf(iwidth, iheight);
-  const int rw = MAX(1, (int)(iwidth * rscale + 0.5f));
-  const int rh = MAX(1, (int)(iheight * rscale + 0.5f));
+  const float rscale = (float)trace_res / fmaxf(cw_img, ch_img);
+
+  const _path_canvas_t canvas = { .rw = MAX(1, (int)(cw_img * rscale + 0.5f)),
+                                  .rh = MAX(1, (int)(ch_img * rscale + 0.5f)),
+                                  .x0 = bbx0 * iwidth - pad_img,
+                                  .y0 = bby0 * iheight - pad_img,
+                                  .scale = rscale,
+                                  .iw = iwidth,
+                                  .ih = iheight };
+  const int rw = canvas.rw, rh = canvas.rh;
 
   // radius in raster pixels (float for sub-pixel EDT threshold)
   const float r_float = fmaxf(0.5f, offset_img_px * rscale);
 
-  dt_print(
-    DT_DEBUG_MASKS, "[masks path] inset: rw=%d rh=%d r_float=%.2f up=%d", rw, rh, r_float, up);
+  dt_print(DT_DEBUG_MASKS,
+           "[masks path] inset: rw=%d rh=%d org=%.1f,%.1f r_float=%.2f up=%d",
+           rw,
+           rh,
+           canvas.x0,
+           canvas.y0,
+           r_float,
+           up);
 
   // New nodes inherit the original mean feather.
   const float mean_border = _path_mean_border(form);
@@ -2739,7 +2833,7 @@ static gboolean _path_morph_core(dt_masks_form_t *form, const float offset_img_p
   const double eps_px = eps_img * rscale;
 
   // rasterize → EDT inset/outset → re-vectorize
-  float *mask = _path_rasterize(form, rw, rh);
+  float *mask = _path_rasterize(form, &canvas);
   if(!mask)
     return FALSE;
 
@@ -2748,7 +2842,7 @@ static gboolean _path_morph_core(dt_masks_form_t *form, const float offset_img_p
   if(!morphed)
     return FALSE;
 
-  GList *new_points = _path_revectorize(morphed, rw, rh, alphamax, eps_px, mean_border);
+  GList *new_points = _path_revectorize(morphed, &canvas, alphamax, eps_px, mean_border);
   dt_free_align(morphed);
   if(!new_points)
     return FALSE;
@@ -2954,6 +3048,9 @@ static int _path_events_mouse_scrolled(dt_iop_module_t *module,
            0.5f);
 
         dt_conf_set_float(DT_MASKS_CONF(form->type, path, border), masks_border);
+        // a resize restores the baseline's borders wholesale, so drop it
+        // here as _path_modify_property does for the same property
+        _resize_state_invalidate(form->formid);
         dt_toast_log(_("feather size: %3.2f%%"),
                      feather_size * 50.0f / g_list_length(form->points));
       }
@@ -3506,35 +3603,22 @@ static int _path_events_button_released(dt_iop_module_t *module,
   dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
   if(!gpt) return 0;
 
-  float wd, ht; // Backbuffer width and height
-  float iwidth, iheight; // Image width and height
-  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
-
   if(gui->form_dragging)
   {
-    // we end the form dragging
+    // the move was already applied incrementally, tick by tick, in
+    // mouse_moved (each tick recomputes its own delta from the *current*
+    // corner, so the shape is already at the correct final position by the
+    // time the button comes up) -- just finalise. Do NOT recompute pts from
+    // this release event's own pzx/pzy and re-apply a second, independent
+    // delta here: that used the constant press-time anchor (gui->dx/dy)
+    // against whatever position this one event happens to carry, so any
+    // discrepancy between it and the last mouse_moved tick's position -- a
+    // slightly stale/short release event is enough -- silently re-moved the
+    // already-correctly-placed shape a second time, observed live as the
+    // shape snapping to a wrong position (typically the image's top-left
+    // corner) right on mouse-up.
     gui->form_dragging = FALSE;
 
-    // we get point0 new values
-    dt_masks_point_path_t *point = form->points->data;
-    float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-    const float dx = pts[0] / iwidth - point->corner[0];
-    const float dy = pts[1] / iheight - point->corner[1];
-
-    // we move all points
-    for(GList *points = form->points; points; points = g_list_next(points))
-    {
-      point = (dt_masks_point_path_t *)points->data;
-      point->corner[0] += dx;
-      point->corner[1] += dy;
-      point->ctrl1[0] += dx;
-      point->ctrl1[1] += dy;
-      point->ctrl2[0] += dx;
-      point->ctrl2[1] += dy;
-    }
-
-    _resize_state_invalidate(form->formid);
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
     // we recreate the form points
@@ -3566,14 +3650,13 @@ static int _path_events_button_released(dt_iop_module_t *module,
   }
   else if(gui->source_dragging)
   {
-    // we end the form dragging
+    // same reasoning as gui->form_dragging just above: mouse_moved already
+    // set form->source fresh on every tick, so recomputing it again here
+    // from this release event's own pzx/pzy is redundant and risks
+    // re-moving the already-correctly-placed source a second time if this
+    // event's position ever diverges from the last tick's.
     gui->source_dragging = FALSE;
 
-    // we change the source value
-    float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-    form->source[0] = pts[0] / iwidth;
-    form->source[1] = pts[1] / iheight;
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
     // we recreate the form points
@@ -3591,8 +3674,16 @@ static int _path_events_button_released(dt_iop_module_t *module,
   }
   else if(gui->point_dragging >= 0)
   {
-    dt_masks_point_path_t *point
-        = (dt_masks_point_path_t *)g_list_nth_data(form->points, gui->point_dragging);
+    // the move was already applied, tick by tick, in mouse_moved (each tick
+    // sets point->corner/ctrl1/ctrl2 to their fresh absolute position) -- the
+    // node is already at the correct final position by the time the button
+    // comes up. Do NOT recompute pts from this release event's own pzx/pzy
+    // and re-apply a second, independent delta on top here: same anti-pattern
+    // as gui->form_dragging above, just at node granularity -- an event whose
+    // position happens to differ from the last mouse_moved tick (e.g. a
+    // spurious/stale release carrying a leftover (0,0)) silently re-moved the
+    // already-correctly-placed node a second time, observed live as the node
+    // snapping to the image's top-left corner right on mouse-up.
     gui->point_dragging = -1;
     if(gui->scrollx != 0.0f || gui->scrolly != 0.0f)
     {
@@ -3600,19 +3691,6 @@ static int _path_events_button_released(dt_iop_module_t *module,
       return 1;
     }
     gui->scrollx = gui->scrolly = 0;
-    float pts[2] = { pzx * wd, pzy * ht };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-    const float dx = pts[0] / iwidth - point->corner[0];
-    const float dy = pts[1] / iheight - point->corner[1];
-
-    point->corner[0] += dx;
-    point->corner[1] += dy;
-    point->ctrl1[0] += dx;
-    point->ctrl1[1] += dy;
-    point->ctrl2[0] += dx;
-    point->ctrl2[1] += dy;
-
-    _path_init_ctrl_points(form);
 
     _resize_state_invalidate(form->formid);
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
@@ -3628,12 +3706,6 @@ static int _path_events_button_released(dt_iop_module_t *module,
     dt_masks_point_path_t *point
         = (dt_masks_point_path_t *)g_list_nth_data(form->points, gui->feather_dragging);
     gui->feather_dragging = -1;
-    float pts[2] = { pzx * wd, pzy * ht };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-
-    _update_bezier_ctrl_points(point, pts[0] / iwidth, pts[1] / iheight,
-                               gui->bezier_ctrl, gui->bezier_mode,
-                               gui->bezier_ctrl_angle, gui->bezier_ctrl_scale, iwidth/iheight);
     gui->bezier_mode = DT_MASKS_BEZIER_NONE;
     point->state = DT_MASKS_POINT_STATE_USER;
 
@@ -3823,6 +3895,7 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
   else if(gui->form_dragging || gui->source_dragging)
   {
     float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
+    dt_masks_clamp_move_pts(pts, wd, ht);
     dt_dev_distort_backtransform(darktable.develop, pts, 1);
 
     // we move all points
@@ -4022,7 +4095,6 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
       {
         gui->feather_selected = k;
         gui->bezier_ctrl = DT_MASKS_PATH_CTRL1;
-        dt_control_queue_redraw_center();
         return 1;
       }
 
@@ -4033,7 +4105,6 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
       {
         gui->feather_selected = k;
         gui->bezier_ctrl = DT_MASKS_PATH_CTRL2;
-        dt_control_queue_redraw_center();
         return 1;
       }
     }
@@ -4044,7 +4115,6 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
        && pzy - gpt->points[k * 6 + 3] < as)
     {
       gui->point_selected = k;
-      dt_control_queue_redraw_center();
       return 1;
     }
   }
@@ -4059,7 +4129,6 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
        && pzy - gpt->points[k * 6 + 3] < as)
     {
       gui->point_selected = k;
-      dt_control_queue_redraw_center();
       return 1;
     }
 
@@ -4070,7 +4139,6 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
        && pzy - gpt->border[k * 6 + 1] < as)
     {
       gui->point_border_selected = k;
-      dt_control_queue_redraw_center();
       return 1;
     }
   }
@@ -4105,7 +4173,6 @@ static int _path_events_mouse_moved(dt_iop_module_t *module,
       gui->form_selected = TRUE;
     }
   }
-  dt_control_queue_redraw_center();
   if(!gui->form_selected && !gui->border_selected && gui->seg_selected < 0)
     return 0;
   if(gui->edit_mode != DT_MASKS_EDIT_FULL)
@@ -4126,26 +4193,25 @@ static void _path_events_post_expose(cairo_t *cr,
   // draw path
   if(gpt->points_count > _nb_wctrl_points(nb) + 6)
   {
-    cairo_move_to(cr, gpt->points[nb * 6], gpt->points[nb * 6 + 1]);
     int seg = 1, seg2 = 0;
-    for(int i = _nb_wctrl_points(nb); i < gpt->points_count; i++)
+    int start = _nb_wctrl_points(nb);
+    for(int i = start; i < gpt->points_count; i++)
     {
-      cairo_line_to(cr, gpt->points[i * 2], gpt->points[i * 2 + 1]);
       // we decide to highlight the form segment by segment
       if(gpt->points[i * 2 + 1] == gpt->points[seg * 6 + 3]
          && gpt->points[i * 2] == gpt->points[seg * 6 + 2])
       {
         // this is the end of the last segment, so we have to draw it
 
-        dt_masks_line_stroke
-          (cr, FALSE, FALSE,
+        dt_masks_stroke_polyline
+          (cr, gpt->points, start, i, FALSE, FALSE, FALSE,
            (gui->group_selected == index)
            && (gui->form_selected || gui->form_dragging || gui->seg_selected == seg2),
            zoom_scale);
         // and we update the segment number
         seg = (seg + 1) % nb;
         seg2++;
-        cairo_move_to(cr, gpt->points[i * 2], gpt->points[i * 2 + 1]);
+        start = i;
       }
     }
   }
@@ -4186,28 +4252,26 @@ static void _path_events_post_expose(cairo_t *cr,
       || gui->group_selected == index)
      && gpt->border_count > _nb_wctrl_points(nb) + 6)
   {
-    int dep = 1;
+    int start = -1;
     for(int i = _nb_wctrl_points(nb); i < gpt->border_count; i++)
     {
       if(gpt->border[i * 2] == DT_INVALID_COORDINATE)
       {
-        if(gpt->border[i * 2 + 1] == DT_INVALID_COORDINATE) break;
-        i = gpt->border[i * 2 + 1] - 1;
         // break the polyline at each self-intersection cut so cairo
         // doesn't draw a shortcut line_to across the invalid region
-        dep = 1;
+        if(start >= 0)
+          dt_masks_stroke_polyline(cr, gpt->border, start, i - 1, FALSE, TRUE, FALSE,
+                                   gui->border_selected, zoom_scale);
+        start = -1;
+        if(gpt->border[i * 2 + 1] == DT_INVALID_COORDINATE) break;
+        i = gpt->border[i * 2 + 1] - 1;
         continue;
       }
-      if(dep)
-      {
-        cairo_move_to(cr, gpt->border[i * 2], gpt->border[i * 2 + 1]);
-        dep = 0;
-      }
-      else
-        cairo_line_to(cr, gpt->border[i * 2], gpt->border[i * 2 + 1]);
+      if(start < 0) start = i;
     }
-    // we execute the drawing
-    dt_masks_line_stroke(cr, TRUE, FALSE, gui->border_selected, zoom_scale);
+    if(start >= 0)
+      dt_masks_stroke_polyline(cr, gpt->border, start, gpt->border_count - 1, FALSE, TRUE, FALSE,
+                               gui->border_selected, zoom_scale);
 
     // we draw the path segment by segment
     for(int k = 0; k < nb; k++)
@@ -4303,15 +4367,8 @@ static void _path_events_post_expose(cairo_t *cr,
     dt_masks_stroke_arrow(cr, gui, index, zoom_scale);
 
     // we draw the source
-    cairo_move_to(cr, gpt->source[nb * 6], gpt->source[nb * 6 + 1]);
-
-    for(int i = _nb_wctrl_points(nb); i < gpt->source_count; i++)
-      cairo_line_to(cr, gpt->source[i * 2], gpt->source[i * 2 + 1]);
-
-    cairo_line_to(cr, gpt->source[nb * 6], gpt->source[nb * 6 + 1]);
-
-    dt_masks_line_stroke
-      (cr, FALSE, TRUE,
+    dt_masks_stroke_polyline
+      (cr, gpt->source, _nb_wctrl_points(nb), gpt->source_count - 1, TRUE, FALSE, TRUE,
        (gui->group_selected == index) && (gui->form_selected || gui->form_dragging),
        zoom_scale);
   }

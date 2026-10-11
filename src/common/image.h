@@ -101,6 +101,9 @@ typedef enum
   DT_IMAGE_MONOCHROME_BAYER = 1 << 19,
   // image has a flag set to use the monochrome workflow in the modules supporting it
   DT_IMAGE_MONOCHROME_WORKFLOW = 1 << 20,
+  // produced by neural restore raw denoise; derived at import from
+  // Xmp.darktable.neural_restore in the file
+  DT_IMAGE_AI_DENOISED = 1 << 21,
 } dt_image_flags_t;
 
 typedef enum dt_image_colorspace_t
@@ -155,7 +158,8 @@ typedef enum dt_image_correction_type_t
   CORRECTION_TYPE_SONY,
   CORRECTION_TYPE_FUJI,
   CORRECTION_TYPE_DNG,
-  CORRECTION_TYPE_OLYMPUS
+  CORRECTION_TYPE_OLYMPUS,
+  CORRECTION_TYPE_PANASONIC
 } dt_image_correction_type_t;
 
 typedef union dt_image_correction_data_t
@@ -177,6 +181,8 @@ typedef union dt_image_correction_data_t
     float centre_vig[2];
     gboolean has_warp;
     gboolean has_vignette;
+    // a GainMap in OpcodeList3, applied after demosaic (see dng_gain_maps_opcode3)
+    gboolean has_gainmap;
   } dng;
   struct {
     gboolean has_dist;
@@ -184,6 +190,14 @@ typedef union dt_image_correction_data_t
     gboolean has_ca;
     float ca[6];
   } olympus;
+  struct {
+    // raw polynomial coefficients from Exif.PanasonicRaw.0x0119, decoded as
+    // word/32768. applied per Rigo's formulation in _init_coeffs_md_v2:
+    //   Ru = Rd + scale * (a*Rd^3 + b*Rd^5 + c*Rd^7)
+    // (Rd, Ru normalised to half-diagonal)
+    float a, b, c;
+    float scale;
+  } panasonic;
 } dt_image_correction_data_t;
 
 typedef enum dt_image_loader_t
@@ -276,6 +290,8 @@ typedef struct dt_image_t
 
   dt_image_correction_type_t exif_correction_type;
   dt_image_correction_data_t exif_correction_data;
+  // the camera applied its own vignetting gain to the raw data
+  gboolean exif_shading_compensation;
 
   char camera_maker[64];
   char camera_model[64];
@@ -308,8 +324,16 @@ typedef struct dt_image_t
 
   dt_iop_buffer_dsc_t buf_dsc;
 
-  float d65_color_matrix[9]; // the 3x3 matrix embedded in some DNGs
-  uint8_t *profile;          // embedded profile, for example from JPEGs
+  float d65_color_matrix[9];                // the 3x3 matrix embedded in some DNGs
+  float dng_forward_matrix[9];              // the 3x3 forward matrix supplied in some DNG files
+  float *profile_hsm_data;                  // hue_div * sat_div * val_div * 3 floats, owned by the struct
+  size_t profile_hsm_data_size;
+  int profile_hsm_hue_div;
+  int profile_hsm_sat_div;
+  int profile_hsm_val_div;
+  int profile_hsm_encoding;                 // 0 = linear prophoto (default), 1 = sRGB
+
+  uint8_t *profile;                         // embedded profile, for example from JPEGs
   uint32_t profile_size;
   dt_image_colorspace_t colorspace; // the colorspace that is
                                     // specified in exif. mostly used
@@ -346,8 +370,15 @@ typedef struct dt_image_t
   /* DefaultUserCrop */
   dt_boundingbox_t usercrop;
 
+  /* aspect ratio dialed in on the camera while shooting, as d:n following
+     the crop module convention; 0:0 if the native sensor ratio was used */
+  int32_t camera_ratio_d, camera_ratio_n;
+
   /* GainMaps from DNG OpcodeList2 exif tag */
   GList *dng_gain_maps;
+
+  /* GainMaps from DNG OpcodeList3 exif tag */
+  GList *dng_gain_maps_opcode3;
 
   /* convenience pointer back into the image cache, so we can return
    * dt_image_t* there directly. */
@@ -392,6 +423,10 @@ gboolean dt_image_is_bayerRGB(const dt_image_t *img);
 gboolean dt_image_is_matrix_correction_supported(const dt_image_t *img);
 /** returns TRUE if the image supports the rawprepare module */
 gboolean dt_image_is_rawprepare_supported(const dt_image_t *img);
+/** returns TRUE if the image is the output of AI raw denoise, so
+ * denoising it again would be a second pass over denoised data */
+gboolean dt_image_is_ai_denoised(const dt_image_t *img);
+
 /** returns the bitmask containing info about monochrome images */
 int dt_image_monochrome_flags(const dt_image_t *img);
 /** returns TRUE if the image has been tested to be monochrome and the

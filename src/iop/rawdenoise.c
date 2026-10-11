@@ -335,115 +335,84 @@ static void wavelet_denoise_xtrans(const float *const restrict in,
       fimg[col] = 0.5f;
       fimg[(size_t)(height-1)*width + col] = 0.5f;
     }
-    const size_t nthreads = dt_get_num_threads();
-    const size_t chunksize = (height + nthreads - 1) / nthreads;
-    DT_OMP_FOR(num_threads(nthreads))
-    for(size_t chunk = 0; chunk < nthreads; chunk++)
+    // build the plane in one pass, top to bottom: sensels are also copied into the neighboring rows, so
+    // the order of the writes decides which value a position keeps; splitting the rows among threads
+    // would make the result depend on the thread count
+    for(size_t row = 0; row < height; row++)
     {
-      const size_t start = chunk * chunksize;
-      const size_t pastend = MIN(start + chunksize,height);
-      for(size_t row = start; row < pastend; row++)
+      const float *const restrict inp = in + row * width;
+      float *const restrict fimgp = fimg + row * width;
+      // handle red/blue pixel in first column
+      if(c != 1 && FCNxtrans(row, 0, xtrans) == c)
       {
-        const float *const restrict inp = in + row * width;
-        float *const restrict fimgp = fimg + row * width;
-        // handle red/blue pixel in first column
-        if(c != 1 && FCNxtrans(row, 0, xtrans) == c)
+        // copy to neighbors above and right
+        const float d = vstransform(inp[0]);
+        fimgp[0] = fimgp[-width] = fimgp[-width+1] = d;
+      }
+      for(size_t col = (c != 1); col < width-1; col++)
+      {
+        if(FCNxtrans(row, col, xtrans) == c)
         {
-          // copy to neighbors above and right
-          const float d = vstransform(inp[0]);
-          fimgp[0] = fimgp[-width] = fimgp[-width+1] = d;
-        }
-        for(size_t col = (c != 1); col < width-1; col++)
-        {
-          if(FCNxtrans(row, col, xtrans) == c)
+          // the pixel at the current location has the desired color, so apply sqrt() as a variance-stablizing
+          // transform, and then do cheap nearest-neighbor interpolation by copying it to appropriate neighbors
+          const float d = vstransform(inp[col]);
+          fimgp[col] = d;
+          if(c == 1) // green pixel
           {
-            // the pixel at the current location has the desired color, so apply sqrt() as a variance-stablizing
-            // transform, and then do cheap nearest-neighbor interpolation by copying it to appropriate neighbors
-            const float d = vstransform(inp[col]);
-            fimgp[col] = d;
-            if(c == 1) // green pixel
-            {
-              // Copy to the right and down.  The X-Trans color layout is such that copying to those two neighbors
-              // results in all positions being filled except in the left-most and right-most columns and sometimes
-              // the topmost and bottom-most rows (depending on how the ROI aligns with the CFA).
-              fimgp[col+1] = fimgp[col+width] = d;
-            }
-            else // red or blue pixel
-            {
-              // Copy value to all eight neighbors; it's OK to copy to the row above even when we're in row 0 (or
-              // the row below when in the last row) because the destination is sandwiched between other buffers
-              // that will be overwritten afterwards anyway.  We need to copy to all adjacent positions because
-              // there may be two green pixels between nearest red/red or blue/blue, so each will cover one of the
-              // greens.
-              fimgp[col-width-1] = fimgp[col-width] = fimgp[col-width+1] = d; // row above
-              fimgp[col-1] = fimgp[col+1] = d;                                // left and right
-              if(row < pastend-1)
-                fimgp[col+width-1] = fimgp[col+width] = fimgp[col+width+1] = d; // row below
-            }
+            // Copy to the right and down.  The X-Trans color layout is such that copying to those two neighbors
+            // results in all positions being filled except in the left-most and right-most columns and sometimes
+            // the topmost and bottom-most rows (depending on how the ROI aligns with the CFA).
+            fimgp[col+1] = fimgp[col+width] = d;
           }
-        }
-        // leftmost and rightmost pixel in the row may still need to be filled in from a neighbor
-        if(FCNxtrans(row, 0, xtrans) != c)
-        {
-          int src = 0;	// fallback is current sensel even if it has the wrong color
-          if(row > 1 && FCNxtrans(row-1, 0, xtrans) == c)
-            src = -width;
-          else if(FCNxtrans(row, 1, xtrans) == c)
-            src = 1;
-          else if(row > 1 && FCNxtrans(row-1, 1, xtrans) == c)
-            src = -width + 1;
-          fimgp[0] = vstransform(inp[src]);
-        }
-        // check the right-most pixel; if it's the desired color and not green, copy it to the neighbors
-        if(c != 1 && FCNxtrans(row, width-1, xtrans) == c)
-        {
-          // copy to neighbors above and left
-          const float d = vstransform(inp[width-1]);
-          fimgp[width-2] = fimgp[width-1] = fimgp[-1] = d;
-        }
-        else if(FCNxtrans(row, width-1, xtrans) != c)
-        {
-          int src = width-1;	// fallback is current sensel even if it has the wrong color
-          if(FCNxtrans(row, width-2, xtrans) == c)
-            src = width-2;
-          else if(row > 1 && FCNxtrans(row-1, width-1, xtrans) == c)
-            src = -1;
-          else if(row > 1 && FCNxtrans(row-1, width-2, xtrans) == c)
-            src = -2;
-          fimgp[width-1] = vstransform(inp[src]);
+          else // red or blue pixel
+          {
+            // Copy value to all eight neighbors; it's OK to copy to the row above even when we're in row 0 (or
+            // the row below when in the last row) because the destination is then one of the two extra rows of
+            // the buffer, which dwt_denoise() never reads.  We need to copy to all adjacent positions because
+            // there may be two green pixels between nearest red/red or blue/blue, so each will cover one of the
+            // greens.
+            fimgp[col-width-1] = fimgp[col-width] = fimgp[col-width+1] = d; // row above
+            fimgp[col-1] = fimgp[col+1] = d;                                // left and right
+            fimgp[col+width-1] = fimgp[col+width] = fimgp[col+width+1] = d; // row below
+          }
         }
       }
-      if(pastend < height)
+      // leftmost and rightmost pixel in the row may still need to be filled in from a neighbor
+      if(FCNxtrans(row, 0, xtrans) != c)
       {
-        // Another slice follows us, and by updating the last row of our slice, we've clobbered values that
-        // were previously written by the other thread.  Restore them.
-        const float *const restrict inp = in + pastend * width;
-        float *const restrict fimgp = fimg + pastend * width;
-        for(size_t col = 0; col < width-1; col++)
-        {
-          if(FCNxtrans(pastend, col, xtrans) == c)
-          {
-            const float d = vstransform(inp[col]);
-            if(c == 1) // green pixel
-            {
-              if(FCNxtrans(pastend, col+1, xtrans) != c)
-                fimgp[col] = fimgp[col+1] = d;  // copy to the right
-            }
-            else // red/blue pixel
-            {
-              // copy the pixel's adjusted value to the prior row and left and right (if not at edge)
-              fimgp[col-width] = fimgp[col-width+1] = d;
-              if(col > 0) fimgp[col-width-1] = d;
-            }
-          }
-          // some red and blue values may need to be restored from the row TWO past the end of our slice
-          if(c != 1 && pastend+1 < height && FCNxtrans(pastend+1, col, xtrans) == c)
-          {
-            const float d = vstransform(inp[col+width]);
-            fimgp[col] = fimgp[col+1] = d;
-            if(col > 0) fimgp[col-1] = d;
-          }
-        }
+        int src = 0;	// fallback is current sensel even if it has the wrong color
+        if(row > 1 && FCNxtrans(row-1, 0, xtrans) == c)
+          src = -width;
+        else if(FCNxtrans(row, 1, xtrans) == c)
+          src = 1;
+        else if(row > 1 && FCNxtrans(row-1, 1, xtrans) == c)
+          src = -width + 1;
+        fimgp[0] = vstransform(inp[src]);
+      }
+      // check the right-most pixel; if it's the desired color and not green, copy it to the neighbors
+      if(c != 1 && FCNxtrans(row, width-1, xtrans) == c)
+      {
+        // copy to neighbors above and left
+        const float d = vstransform(inp[width-1]);
+        fimgp[width-2] = fimgp[width-1] = fimgp[-1] = d;
+      }
+      else if(FCNxtrans(row, width-1, xtrans) != c)
+      {
+        int src = width-1;	// fallback is current sensel even if it has the wrong color
+        if(FCNxtrans(row, width-2, xtrans) == c)
+          src = width-2;
+        else if(row > 1 && FCNxtrans(row-1, width-1, xtrans) == c)
+          src = -1;
+        else if(row > 1 && FCNxtrans(row-1, width-2, xtrans) == c)
+          src = -2;
+        fimgp[width-1] = vstransform(inp[src]);
+      }
+      else // green right-most pixel in the green plane
+      {
+        // the loop above stops one column short, so it never writes this sensel into the plane. If the left
+        // neighbor is green, the position would keep that neighbor's value. Otherwise it would keep the value
+        // the red pass left there, or the 0.5f placeholder in the top and bottom rows
+        fimgp[width-1] = vstransform(inp[width-1]);
       }
     }
 
@@ -723,7 +692,7 @@ static gboolean rawdenoise_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t
   // draw labels:
   PangoLayout *layout;
   PangoRectangle ink;
-  PangoFontDescription *desc = pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+  PangoFontDescription *desc = dt_gui_get_font();
   pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
   pango_font_description_set_absolute_size(desc, (.08 * height) * PANGO_SCALE);
   layout = pango_cairo_create_layout(cr);
@@ -766,16 +735,17 @@ static gboolean rawdenoise_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t
   return FALSE;
 }
 
-static gboolean rawdenoise_motion_notify(GtkWidget *widget, GdkEventMotion *event, dt_iop_module_t *self)
+static void rawdenoise_motion_notify(GtkEventControllerMotion *controller, gdouble x, gdouble y, dt_iop_module_t *self)
 {
   dt_iop_rawdenoise_gui_data_t *g = self->gui_data;
   dt_iop_rawdenoise_params_t *p = self->params;
+  GtkWidget *widget = dt_gui_get_widget(controller);
   const int inset = DT_IOP_RAWDENOISE_INSET;
   GtkAllocation allocation;
   gtk_widget_get_allocation(widget, &allocation);
   int height = allocation.height - 2 * inset, width = allocation.width - 2 * inset;
-  if(!g->dragging) g->mouse_x = CLAMP(dt_gdk_event_get_x(event) - inset, 0, width) / (float)width;
-  g->mouse_y = 1.0 - CLAMP(dt_gdk_event_get_y(event) - inset, 0, height) / (float)height;
+  if(!g->dragging) g->mouse_x = CLAMP(x - inset, 0, width) / (float)width;
+  g->mouse_y = 1.0 - CLAMP(y - inset, 0, height) / (float)height;
   if(g->dragging)
   {
     *p = g->drag_params;
@@ -791,14 +761,18 @@ static gboolean rawdenoise_motion_notify(GtkWidget *widget, GdkEventMotion *even
     g->x_move = -1;
     gtk_widget_queue_draw(widget);
   }
-  return TRUE;
 }
 
-static gboolean rawdenoise_button_press(GtkWidget *widget, GdkEventButton *event, dt_iop_module_t *self)
+static void rawdenoise_button_press(GtkGestureSingle *gesture, gint n_press, gdouble x, gdouble y, dt_iop_module_t *self)
 {
   dt_iop_rawdenoise_gui_data_t *g = self->gui_data;
   const int ch = g->channel;
-  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY && dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS)
+  if(gtk_gesture_single_get_current_button(gesture) != GDK_BUTTON_PRIMARY)
+    return;
+
+  GtkWidget *widget = dt_gui_get_widget(gesture);
+
+  if(n_press >= 2)
   {
     // reset current curve
     dt_iop_rawdenoise_params_t *p = self->params;
@@ -811,7 +785,7 @@ static gboolean rawdenoise_button_press(GtkWidget *widget, GdkEventButton *event
     dt_dev_add_history_item_target(darktable.develop, self, TRUE, widget + ch);
     gtk_widget_queue_draw(GTK_WIDGET(g->area));
   }
-  else if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
+  else
   {
     g->drag_params = *(dt_iop_rawdenoise_params_t *)self->params;
     const int inset = DT_IOP_RAWDENOISE_INSET;
@@ -819,50 +793,44 @@ static gboolean rawdenoise_button_press(GtkWidget *widget, GdkEventButton *event
     gtk_widget_get_allocation(widget, &allocation);
     int height = allocation.height - 2 * inset, width = allocation.width - 2 * inset;
     g->mouse_pick
-        = dt_draw_curve_calc_value(g->transition_curve, CLAMP(dt_gdk_event_get_x(event) - inset, 0, width) / (float)width);
-    g->mouse_pick -= 1.0 - CLAMP(dt_gdk_event_get_y(event) - inset, 0, height) / (float)height;
+        = dt_draw_curve_calc_value(g->transition_curve, CLAMP(x - inset, 0, width) / (float)width);
+    g->mouse_pick -= 1.0 - CLAMP(y - inset, 0, height) / (float)height;
     g->dragging = 1;
-    return TRUE;
   }
-  return FALSE;
 }
 
-static gboolean rawdenoise_button_release(GtkWidget *widget, GdkEventButton *event, dt_iop_module_t *self)
+static void rawdenoise_button_release(GtkGestureSingle *gesture, gint n_press, gdouble x, gdouble y, dt_iop_module_t *self)
 {
-  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
-  {
-    dt_iop_rawdenoise_gui_data_t *g = self->gui_data;
-    g->dragging = 0;
-    return TRUE;
-  }
-  return FALSE;
+  if(gtk_gesture_single_get_current_button(gesture) != GDK_BUTTON_PRIMARY)
+    return;
+
+  dt_iop_rawdenoise_gui_data_t *g = self->gui_data;
+  g->dragging = 0;
 }
 
-static gboolean rawdenoise_leave_notify(GtkWidget *widget, GdkEventCrossing *event, dt_iop_module_t *self)
+static void rawdenoise_leave_notify(GtkEventControllerMotion *controller, dt_iop_module_t *self)
 {
   dt_iop_rawdenoise_gui_data_t *g = self->gui_data;
   if(!g->dragging) g->mouse_y = -1.0;
-  gtk_widget_queue_draw(widget);
-  return TRUE;
+  gtk_widget_queue_draw(dt_gui_get_widget(controller));
 }
 
-static gboolean rawdenoise_scrolled(GtkWidget *widget, GdkEventScroll *event, dt_iop_module_t *self)
+static void rawdenoise_scrolled(GtkEventControllerScroll *controller, gdouble dx, gdouble dy, dt_iop_module_t *self)
 {
   dt_iop_rawdenoise_gui_data_t *g = self->gui_data;
 
-  if(dt_gui_ignore_scroll(event)) return FALSE;
-
-  if(dt_modifier_is(dt_gdk_event_get_state(event), GDK_MOD1_MASK))
-    return gtk_widget_event(GTK_WIDGET(g->channel_tabs), (GdkEvent*)event);
-
-  int delta_y;
-  if(dt_gui_get_scroll_unit_delta(event, &delta_y))
+  if(dt_modifier_eq(controller, GDK_MOD1_MASK))
   {
-    g->mouse_radius = CLAMP(g->mouse_radius * (1.0 - 0.1 * delta_y), 0.2 / DT_IOP_RAWDENOISE_BANDS, 1.0);
-    gtk_widget_queue_draw(widget);
+    // alt+scroll switches the channel tab (as before the controller conversion)
+    dt_gui_forward_scroll(controller, GTK_WIDGET(g->channel_tabs));
+    return;
   }
 
-  return TRUE;
+  if(dy != 0.0)
+  {
+    g->mouse_radius = CLAMP(g->mouse_radius * (1.0 - 0.1 * dy), 0.2 / DT_IOP_RAWDENOISE_BANDS, 1.0);
+    gtk_widget_queue_draw(dt_gui_get_widget(controller));
+  }
 }
 
 static void rawdenoise_tab_switch(GtkNotebook *notebook, GtkWidget *page, guint page_num, dt_iop_module_t *self)
@@ -913,11 +881,11 @@ void gui_init(dt_iop_module_t *self)
   GtkWidget *box_raw = self->widget = dt_gui_vbox(g->channel_tabs, g->area);
 
   g_signal_connect(G_OBJECT(g->area), "draw", G_CALLBACK(rawdenoise_draw), self);
-  g_signal_connect(G_OBJECT(g->area), "button-press-event", G_CALLBACK(rawdenoise_button_press), self);
-  g_signal_connect(G_OBJECT(g->area), "button-release-event", G_CALLBACK(rawdenoise_button_release), self);
-  g_signal_connect(G_OBJECT(g->area), "motion-notify-event", G_CALLBACK(rawdenoise_motion_notify), self);
-  g_signal_connect(G_OBJECT(g->area), "leave-notify-event", G_CALLBACK(rawdenoise_leave_notify), self);
-  g_signal_connect(G_OBJECT(g->area), "scroll-event", G_CALLBACK(rawdenoise_scrolled), self);
+  dt_gui_connect_click(g->area, rawdenoise_button_press, rawdenoise_button_release, self);
+  dt_gui_connect_motion(g->area, rawdenoise_motion_notify, NULL, rawdenoise_leave_notify, self);
+  dt_gui_connect_scroll(g->area, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES
+                                   | GTK_EVENT_CONTROLLER_SCROLL_DISCRETE,
+                        rawdenoise_scrolled, self);
 
   g->threshold = dt_bauhaus_slider_from_params(self, "threshold");
   dt_bauhaus_slider_set_soft_max(g->threshold, 0.1);

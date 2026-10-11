@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "common/gdk_event_utils.h"
 
 #include "common/collection.h"
@@ -32,9 +33,16 @@
 #include "libs/lib.h"
 #include "libs/lib_api.h"
 #include "views/view.h"
+
+#include <glib-2.0/gio/gio.h>
+#include <glib-2.0/gio/gmenu.h>
+#include <glib-2.0/gio/gmenumodel.h>
+#include <glib-2.0/glib-object.h>
+
 #ifdef GDK_WINDOWING_QUARTZ
 #include "osx/osx.h"
 #endif
+
 #include <gdk/gdkkeysyms.h>
 #include <math.h>
 
@@ -1331,9 +1339,11 @@ static void _detach_button_clicked(GtkButton *button,
   _detach_selected_tag(d->attached_view, self);
 }
 
-static void _pop_menu_attached_attach_to_all(GtkWidget *menuitem,
-                                             dt_lib_module_t *self)
+static void _pop_menu_attached_attach_to_all(GSimpleAction *action,
+                                             GVariant *parameter,
+                                             gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
   GtkTreeIter iter;
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(d->attached_view));
@@ -1384,16 +1394,20 @@ static void _pop_menu_attached_attach_to_all(GtkWidget *menuitem,
   }
 }
 
-static void _pop_menu_attached_detach(GtkWidget *menuitem,
-                                      dt_lib_module_t *self)
+static void _pop_menu_attached_detach(GSimpleAction *action,
+                                      GVariant *parameter,
+                                      gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
   _detach_selected_tag(d->attached_view, self);
 }
 
-static void _pop_menu_attached_find(GtkWidget *menuitem,
-                                    dt_lib_module_t *self)
+static void _pop_menu_attached_find(GSimpleAction *action,
+                                    GVariant *parameter,
+                                    gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
   gchar *name;
   GtkTreeIter iter;
@@ -1408,9 +1422,11 @@ static void _pop_menu_attached_find(GtkWidget *menuitem,
   g_free(name);
 }
 
-static void _pop_menu_attached_clipboard(GtkWidget *menuitem,
-                                         dt_lib_module_t *self)
+static void _pop_menu_attached_clipboard(GSimpleAction *action,
+                                         GVariant *parameter,
+                                         gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
   gchar *path;
   GtkTreeIter iter;
@@ -1430,8 +1446,30 @@ static void _pop_menu_attached(GtkWidget *treeview,
                                dt_lib_module_t *self)
 {
   dt_lib_tagging_t *d = self->data;
-  GtkWidget *menu, *menuitem;
-  menu = gtk_menu_new();
+
+  GActionGroup *action_group = gtk_widget_get_action_group(treeview, "tags_attached");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "attach_all", _pop_menu_attached_attach_to_all, NULL, NULL },
+      { "detach",     _pop_menu_attached_detach,        NULL, NULL },
+      { "find",       _pop_menu_attached_find,          NULL, NULL },
+      { "clipboard",  _pop_menu_attached_clipboard,     NULL, NULL }
+    };
+
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(treeview, 
+                                   "tags_attached",
+                                   G_ACTION_GROUP(action_group));
+  }
+
+  GMenu *menu = g_menu_new();
+  GMenu *section = menu;
 
   GtkTreeIter iter;
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(d->attached_view));
@@ -1444,47 +1482,48 @@ static void _pop_menu_attached(GtkWidget *treeview,
     gtk_tree_model_get(model, &iter, DT_LIB_TAGGING_COL_SEL, &sel, -1);
     if(sel == DT_TS_SOME_IMAGES)
     {
-      menuitem = gtk_menu_item_new_with_label(_("attach tag to all"));
-      g_signal_connect(menuitem, "activate",
-                       G_CALLBACK(_pop_menu_attached_attach_to_all), self);
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-      menuitem = gtk_separator_menu_item_new();
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
+      g_menu_append(section, _("attach tag to all"), "tags_attached.attach_all");
+      section = g_menu_new();
+      g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
     }
   }
 
-  menuitem = gtk_menu_item_new_with_label(_("detach tag"));
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-  g_signal_connect(menuitem, "activate", G_CALLBACK(_pop_menu_attached_detach), self);
+  g_menu_append(section, _("detach tag"), "tags_attached.detach");
+  g_menu_append(section, _("find tag"), "tags_attached.find");
+  g_menu_append(section, _("copy to clipboard"), "tags_attached.clipboard");
 
-  menuitem = gtk_menu_item_new_with_label(_("find tag"));
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-  g_signal_connect(menuitem, "activate", G_CALLBACK(_pop_menu_attached_find), self);
-  menuitem = gtk_menu_item_new_with_label(_("copy to clipboard"));
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-  g_signal_connect(menuitem, "activate", G_CALLBACK(_pop_menu_attached_clipboard), self);
+  GdkRectangle rect;
+  GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+  GtkTreeViewColumn *column = gtk_tree_view_get_column(GTK_TREE_VIEW(treeview), DT_LIB_TAGGING_COL_ID);
+  gtk_tree_view_get_background_area(GTK_TREE_VIEW(treeview), path, column, &rect);
 
-  gtk_widget_show_all(GTK_WIDGET(menu));
-
-  gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+  // popup the menu
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(treeview, menu);
+  g_object_unref(menu);
+  gtk_popover_set_pointing_to(GTK_POPOVER(popover_menu), &rect);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
-static gboolean _click_on_view_attached(GtkWidget *view,
-                                        GdkEventButton *event,
-                                        dt_lib_module_t *self)
+static void _click_on_view_attached(GtkGestureSingle *gesture,
+                                      int n_press,
+                                      double x,
+                                      double y,
+                                      dt_lib_module_t *self)
 {
   dt_lib_tagging_t *d = self->data;
+  GtkWidget *view = dt_gui_get_widget(gesture);
   _unselect_all_in_view(d->dictionary_view);
 
-  if((dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY)
-    || (dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
-    || (dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY))
+  const guint button = gtk_gesture_single_get_current_button(gesture);
+  if((n_press == 1 && button == GDK_BUTTON_SECONDARY)
+     || (n_press == 2 && button == GDK_BUTTON_PRIMARY)
+     || (n_press == 1 && button == GDK_BUTTON_PRIMARY))
   {
     GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
     GtkTreePath *path = NULL;
     // Get tree path for row that was clicked
     if(gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(view),
-                                     (gint)dt_gdk_event_get_x(event), (gint)dt_gdk_event_get_y(event),
+                                     (gint)x, (gint)y,
                                      &path, NULL, NULL, NULL))
     {
       gboolean valid_tag = FALSE;
@@ -1497,46 +1536,50 @@ static gboolean _click_on_view_attached(GtkWidget *view,
       {
         gtk_tree_selection_select_path(selection, path);
         dt_lib_gui_queue_update(self);
-        if(dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS
-           && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY)
+        if(n_press == 1 && button == GDK_BUTTON_SECONDARY)
         {
-          _pop_menu_attached(view, event, self);
+          dt_gui_claim(gesture);
+          const GdkEvent *event = gtk_gesture_get_last_event(GTK_GESTURE(gesture), NULL);
+          _pop_menu_attached(view, (GdkEventButton *)event, self);
           gtk_tree_path_free(path);
-          return TRUE;
+          return;
         }
-        else if(dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS
-                && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
+        else if(n_press == 2 && button == GDK_BUTTON_PRIMARY)
         {
+          dt_gui_claim(gesture);
           _detach_selected_tag(d->attached_view, self);
           gtk_tree_path_free(path);
-          return TRUE;
+          return;
         }
       }
       else
       { // prevent to select a darktable tag
+        dt_gui_claim(gesture);
         gtk_tree_path_free(path);
-        return TRUE;
+        return;
       }
     }
     gtk_tree_path_free(path);
   }
-  return FALSE;
 }
 
-static gboolean _attached_key_pressed(GtkWidget *view,
-                                      GdkEventKey *event,
-                                      dt_lib_module_t *self)
+static gboolean _attached_key_pressed(GtkEventControllerKey *controller,
+                                       guint keyval,
+                                       guint keycode,
+                                       GdkModifierType state,
+                                       dt_lib_module_t *self)
 {
   dt_lib_tagging_t *d = self->data;
   _unselect_all_in_view(d->dictionary_view);
 
+  GtkWidget *view = dt_gui_get_widget(controller);
   GtkTreeIter iter;
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(d->attached_view));
   GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
   if(gtk_tree_selection_get_selected(selection, &model, &iter))
   {
     GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-    switch(dt_gdk_event_get_keyval(event))
+    switch(keyval)
     {
       case GDK_KEY_Delete:
       case GDK_KEY_KP_Delete:
@@ -1548,13 +1591,13 @@ static gboolean _attached_key_pressed(GtkWidget *view,
     }
     gtk_tree_path_free(path);
   }
-  if(dt_gdk_event_get_keyval(event) == GDK_KEY_Tab)
+  if(keyval == GDK_KEY_Tab)
   {
     gtk_tree_selection_unselect_all(selection);
     gtk_widget_grab_focus(GTK_WIDGET(d->entry));
     return TRUE;
   }
-  else if(dt_gdk_event_get_keyval(event) == GDK_KEY_ISO_Left_Tab)
+  else if(keyval == GDK_KEY_ISO_Left_Tab)
   {
     gtk_tree_selection_unselect_all(selection);
     return TRUE;
@@ -1603,12 +1646,15 @@ static void _new_button_clicked(GtkButton *button, dt_lib_module_t *self)
                     tagname ? tagname + 1 : d->last_tag, FALSE, TRUE);
 }
 
-static gboolean _enter_key_pressed(GtkWidget *entry,
-                                   GdkEventKey *event,
-                                   dt_lib_module_t *self)
+static gboolean _enter_key_pressed(GtkEventControllerKey *controller,
+                                     guint keyval,
+                                     guint keycode,
+                                     GdkModifierType state,
+                                     dt_lib_module_t *self)
 {
   dt_lib_tagging_t *d = self->data;
-  switch(dt_gdk_event_get_keyval(event))
+  GtkWidget *entry = dt_gui_get_widget(controller);
+  switch(keyval)
   {
     case GDK_KEY_Return:
     case GDK_KEY_KP_Enter:
@@ -1672,10 +1718,11 @@ static void _tag_name_changed(GtkEntry *entry,
   }
 }
 
-static void _pop_menu_dictionary_delete_tag(GtkWidget *menuitem,
-                                            dt_lib_module_t *self,
-                                            const gboolean branch)
+static void _pop_menu_dictionary_delete_tag(GSimpleAction *action,
+                                            GVariant *parameter,
+                                            gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
 
   int res = GTK_RESPONSE_YES;
@@ -1761,9 +1808,11 @@ static void _pop_menu_dictionary_delete_tag(GtkWidget *menuitem,
   _raise_signal_tag_changed(self);
 }
 
-static void _pop_menu_dictionary_delete_node(GtkWidget *menuitem,
-                                             dt_lib_module_t *self)
+static void _pop_menu_dictionary_delete_node(GSimpleAction *action,
+                                             GVariant *parameter,
+                                             gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
 
   int res = GTK_RESPONSE_YES;
@@ -1859,9 +1908,11 @@ static void _name_changed(GtkEntry *entry,
 
 // create tag allows the user to create a single tag, which can be an
 // element of the hierarchy or not
-static void _pop_menu_dictionary_create_tag(GtkWidget *menuitem,
-                                            dt_lib_module_t *self)
+static void _pop_menu_dictionary_create_tag(GSimpleAction *action,
+                                            GVariant *parameter,
+                                            gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
 
   char *tagname;
@@ -1977,9 +2028,11 @@ static void _pop_menu_dictionary_create_tag(GtkWidget *menuitem,
 
 // edit tag allows the user to rename a single tag, which can be an
 // element of the hierarchy and change other parameters
-static void _pop_menu_dictionary_edit_tag(GtkWidget *menuitem,
-                                          dt_lib_module_t *self)
+static void _pop_menu_dictionary_edit_tag(GSimpleAction *action,
+                                          GVariant *parameter,
+                                          gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
 
   char *tagname;
@@ -2151,7 +2204,7 @@ static void _pop_menu_dictionary_edit_tag(GtkWidget *menuitem,
 
       // update the store
       GtkTreeModel *store = gtk_tree_model_filter_get_model(GTK_TREE_MODEL_FILTER(model));
-      dt_tag_op_t *to = g_malloc(sizeof(dt_tag_op_t));
+      dt_tag_op_t *to = g_try_malloc(sizeof(dt_tag_op_t));
       if(to)
       {
         to->tree_flag = d->tree_flag;
@@ -2293,9 +2346,11 @@ static gboolean _apply_rename_path(GtkWidget *dialog,
 }
 
 // rename path allows the user to redefine a hierarchy
-static void _pop_menu_dictionary_change_path(GtkWidget *menuitem,
-                                             dt_lib_module_t *self)
+static void _pop_menu_dictionary_change_path(GSimpleAction *action,
+                                             GVariant *parameter,
+                                             gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
 
   char *tagname;
@@ -2382,10 +2437,13 @@ static void _pop_menu_dictionary_change_path(GtkWidget *menuitem,
   g_free(tagname);
 }
 
-static void _pop_menu_dictionary_goto_tag_collection(GtkWidget *menuitem,
-                                                     dt_lib_module_t *self)
+static void _pop_menu_dictionary_goto_tag_collection(GSimpleAction *action,
+                                                     GVariant *parameter,
+                                                     gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
+
   GtkTreeIter iter;
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(d->dictionary_view));
   GtkTreeSelection *selection = gtk_tree_view_get_selection
@@ -2413,10 +2471,13 @@ static void _pop_menu_dictionary_goto_tag_collection(GtkWidget *menuitem,
   }
 }
 
-static void _pop_menu_dictionary_goto_collection_back(GtkWidget *menuitem,
-                                                      dt_lib_module_t *self)
+static void _pop_menu_dictionary_goto_collection_back(GSimpleAction *action,
+                                                      GVariant *parameter,
+                                                      gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
+
   if(d->collection[0])
   {
     dt_control_signal_block_by_func(darktable.signals,
@@ -2428,10 +2489,13 @@ static void _pop_menu_dictionary_goto_collection_back(GtkWidget *menuitem,
   }
 }
 
-static void _pop_menu_dictionary_copy_tag(GtkWidget *menuitem,
-                                          dt_lib_module_t *self)
+static void _pop_menu_dictionary_copy_tag(GSimpleAction *action,
+                                          GVariant *parameter,
+                                          gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
+
   GtkTreeIter iter;
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(d->dictionary_view));
   GtkTreeSelection *selection =
@@ -2447,10 +2511,13 @@ static void _pop_menu_dictionary_copy_tag(GtkWidget *menuitem,
   }
 }
 
-static void _pop_menu_dictionary_clipboard(GtkWidget *menuitem,
-                                           dt_lib_module_t *self)
+static void _pop_menu_dictionary_clipboard(GSimpleAction *action,
+                                           GVariant *parameter,
+                                           gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
+
   GtkTreeIter iter;
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(d->dictionary_view));
   GtkTreeSelection *selection =
@@ -2464,23 +2531,29 @@ static void _pop_menu_dictionary_clipboard(GtkWidget *menuitem,
   }
 }
 
-static void _pop_menu_dictionary_attach_tag(GtkWidget *menuitem,
-                                            dt_lib_module_t *self)
+static void _pop_menu_dictionary_attach_tag(GSimpleAction *action,
+                                            GVariant *parameter,
+                                            gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
   _attach_selected_tag(self, d);
 }
 
-static void _pop_menu_dictionary_detach_tag(GtkWidget *menuitem,
-                                            dt_lib_module_t *self)
+static void _pop_menu_dictionary_detach_tag(GSimpleAction *action,
+                                            GVariant *parameter,
+                                            gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
   _detach_selected_tag(d->dictionary_view, self);
 }
 
-static void _pop_menu_dictionary_set_as_tag(GtkWidget *menuitem,
-                                            dt_lib_module_t *self)
+static void _pop_menu_dictionary_set_as_tag(GSimpleAction *action,
+                                            GVariant *parameter,
+                                            gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_tagging_t *d = self->data;
   char *tagname;
   guint new_tagid;
@@ -2507,6 +2580,36 @@ static void _pop_menu_dictionary(GtkWidget *treeview,
                                  dt_lib_module_t *self)
 {
   dt_lib_tagging_t *d = self->data;
+
+  GActionGroup *action_group = gtk_widget_get_action_group(treeview, "tags_dictionary");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "attach",      _pop_menu_dictionary_attach_tag,           NULL, NULL },
+      { "detach",      _pop_menu_dictionary_detach_tag,           NULL, NULL },
+      { "create",      _pop_menu_dictionary_create_tag,           NULL, NULL },
+      { "delete",      _pop_menu_dictionary_delete_tag,           NULL, NULL },
+      { "delete_node", _pop_menu_dictionary_delete_node,          NULL, NULL },
+      { "edit",        _pop_menu_dictionary_edit_tag,             NULL, NULL },
+      { "path",        _pop_menu_dictionary_change_path,          NULL, NULL },
+      { "setastag",    _pop_menu_dictionary_set_as_tag,           NULL, NULL },
+      { "copytoentry", _pop_menu_dictionary_copy_tag,             NULL, NULL },
+      { "clipboard",   _pop_menu_dictionary_clipboard,            NULL, NULL },
+      { "goto",        _pop_menu_dictionary_goto_tag_collection,  NULL, NULL },
+      { "back",        _pop_menu_dictionary_goto_collection_back, NULL, NULL }
+    };
+
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(treeview, 
+                                   "tags_dictionary",
+                                   G_ACTION_GROUP(action_group));
+  }
+
   GtkTreeIter iter, child;
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(d->dictionary_view));
   GtkTreeSelection *selection =
@@ -2518,87 +2621,49 @@ static void _pop_menu_dictionary(GtkWidget *treeview,
                        DT_LIB_TAGGING_COL_ID, &tagid,
                        DT_LIB_TAGGING_COL_COUNT, &count, -1);
 
-    GtkWidget *menu, *menuitem;
-    menu = gtk_menu_new();
+    GMenu *menu = g_menu_new();
+    GMenu *section = menu;
 
     if(tagid)
     {
-      menuitem = gtk_menu_item_new_with_label(_("attach tag"));
-      g_signal_connect(menuitem, "activate",
-                       G_CALLBACK(_pop_menu_dictionary_attach_tag), self);
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
+      g_menu_append(section, _("attach tag"), "tags_dictionary.attach");
+      g_menu_append(section, _("detach tag"), "tags_dictionary.detach");
 
-      menuitem = gtk_menu_item_new_with_label(_("detach tag"));
-      g_signal_connect(menuitem, "activate",
-                       G_CALLBACK(_pop_menu_dictionary_detach_tag), self);
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-
-      menuitem = gtk_separator_menu_item_new();
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
+      section = g_menu_new();
+      g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
     }
     if(d->tree_flag || !d->suggestion_flag)
     {
-      menuitem = gtk_menu_item_new_with_label(_("create tag..."));
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-      g_signal_connect(menuitem, "activate",
-                       G_CALLBACK(_pop_menu_dictionary_create_tag), self);
+      g_menu_append(section, _("create tag..."), "tags_dictionary.create");
 
       if(tagid)
-      {
-        menuitem = gtk_menu_item_new_with_label(_("delete tag"));
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-        g_signal_connect(menuitem, "activate",
-                         G_CALLBACK(_pop_menu_dictionary_delete_tag), self);
-      }
+        g_menu_append(section, _("delete tag"), "tags_dictionary.delete");
 
       if(gtk_tree_model_iter_children(model, &child, &iter))
-      {
-        menuitem = gtk_menu_item_new_with_label(_("delete node"));
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-        g_signal_connect(menuitem, "activate",
-                         G_CALLBACK(_pop_menu_dictionary_delete_node), self);
-      }
+        g_menu_append(section, _("delete node"), "tags_dictionary.delete_node");
 
-      menuitem = gtk_menu_item_new_with_label(_("edit..."));
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-      g_signal_connect(menuitem, "activate",
-                       G_CALLBACK(_pop_menu_dictionary_edit_tag), self);
+      g_menu_append(section, _("edit"), "tags_dictionary.edit");
     }
 
     if(d->tree_flag)
-    {
-      menuitem = gtk_menu_item_new_with_label(_("change path..."));
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-      g_signal_connect(menuitem, "activate",
-                       G_CALLBACK(_pop_menu_dictionary_change_path), self);
-    }
+        g_menu_append(section, _("change path..."), "tags_dictionary.path");
 
     if(d->tree_flag && !tagid)
     {
-      menuitem = gtk_separator_menu_item_new();
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
+      section = g_menu_new();
+      g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
 
-      menuitem = gtk_menu_item_new_with_label(_("set as a tag"));
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-      g_signal_connect(menuitem, "activate",
-                       G_CALLBACK(_pop_menu_dictionary_set_as_tag), self);
+      g_menu_append(section, _("set as tag"), "tags_dictionary.setastag");
     }
 
     if(!d->suggestion_flag)
     {
-      menuitem = gtk_separator_menu_item_new();
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
+      section = g_menu_new();
+      g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
     }
 
-    menuitem = gtk_menu_item_new_with_label(_("copy to entry"));
-    g_signal_connect(menuitem, "activate",
-                     G_CALLBACK(_pop_menu_dictionary_copy_tag), self);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-
-    menuitem = gtk_menu_item_new_with_label(_("copy to clipboard"));
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-    g_signal_connect(menuitem, "activate",
-                     G_CALLBACK(_pop_menu_dictionary_clipboard), self);
+    g_menu_append(section, _("copy to entry"), "tags_dictionary.copytoentry");
+    g_menu_append(section, _("copy to clipboard"), "tags_dictionary.clipboard");
 
     if(d->collection[0])
     {
@@ -2612,51 +2677,56 @@ static void _pop_menu_dictionary(GtkWidget *treeview,
     }
     if(count || d->collection[0])
     {
-      menuitem = gtk_separator_menu_item_new();
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-      if(count)
-      {
-        menuitem = gtk_menu_item_new_with_label(_("go to tag collection"));
-        g_signal_connect(menuitem, "activate",
-                         G_CALLBACK(_pop_menu_dictionary_goto_tag_collection), self);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-      }
-      if(d->collection[0])
-      {
-        menuitem = gtk_menu_item_new_with_label(_("go back to work"));
-        g_signal_connect(menuitem, "activate",
-                         G_CALLBACK(_pop_menu_dictionary_goto_collection_back), self);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), menuitem);
-      }
-    }
-    gtk_widget_show_all(GTK_WIDGET(menu));
+      section = g_menu_new();
+      g_menu_append_section(menu, NULL, G_MENU_MODEL(section));
 
-    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)event);
+      if(count)
+        g_menu_append(section, _("go to tag collection"), "tags_dictionary.goto");
+
+      if(d->collection[0])
+        g_menu_append(section, _("go back to work"), "tags_dictionary.back");
+    }
+
+    GdkRectangle rect;
+    GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+    GtkTreeViewColumn *column = gtk_tree_view_get_column(GTK_TREE_VIEW(treeview), DT_LIB_TAGGING_COL_ID);
+    gtk_tree_view_get_background_area(GTK_TREE_VIEW(treeview), path, column, &rect);
+
+    // popup the menu
+    GtkWidget *popover_menu = dt_gui_popover_menu_from_model(treeview, menu);
+    g_object_unref(menu);
+    gtk_popover_set_pointing_to(GTK_POPOVER(popover_menu), &rect);
+    gtk_popover_popup(GTK_POPOVER(popover_menu));
   }
 }
 
-static gboolean _click_on_view_dictionary(GtkWidget *view,
-                                          GdkEventButton *event,
-                                          dt_lib_module_t *self)
+static void _click_on_view_dictionary(GtkGestureSingle *gesture,
+                                        int n_press,
+                                        double x,
+                                        double y,
+                                        dt_lib_module_t *self)
 {
   dt_lib_tagging_t *d = self->data;
+  GtkWidget *view = dt_gui_get_widget(gesture);
   _unselect_all_in_view(d->attached_view);
 
-  const int button_pressed = (dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS) ? dt_gdk_event_get_button(event) : 0;
-  const gboolean shift_pressed = dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK);
-  if((button_pressed == GDK_BUTTON_SECONDARY)                     // contextual menu
-     || (d->tree_flag && button_pressed == GDK_BUTTON_PRIMARY)    // expand & drag
-     || (dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)) // attach
+  const GdkEvent *event = gtk_gesture_get_last_event(GTK_GESTURE(gesture), NULL);
+  const GdkModifierType state = event ? dt_gdk_event_get_state(event) : 0;
+  const guint button = gtk_gesture_single_get_current_button(gesture);
+  const gboolean shift_pressed = dt_modifier_is(state, GDK_SHIFT_MASK);
+  if((button == GDK_BUTTON_SECONDARY && n_press == 1)          // contextual menu
+     || (d->tree_flag && button == GDK_BUTTON_PRIMARY && n_press == 1)  // expand & drag
+     || (n_press == 2 && button == GDK_BUTTON_PRIMARY))        // attach
   {
     GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
     GtkTreePath *path = NULL;
     // Get tree path for row that was clicked
     if(gtk_tree_view_get_path_at_pos(GTK_TREE_VIEW(view),
-                                     (gint)dt_gdk_event_get_x(event), (gint)dt_gdk_event_get_y(event),
+                                     (gint)x, (gint)y,
                                      &path, NULL, NULL, NULL))
     {
       if(d->tree_flag
-         && button_pressed == GDK_BUTTON_PRIMARY
+         && button == GDK_BUTTON_PRIMARY && n_press == 1
          && !shift_pressed)
       {
         GtkTreeModel *model = gtk_tree_view_get_model(d->dictionary_view);
@@ -2671,60 +2741,69 @@ static gboolean _click_on_view_dictionary(GtkWidget *view,
         d->drag.path = path;
         if(d->drag.lastpath) gtk_tree_path_free(d->drag.lastpath);
         d->drag.lastpath = NULL;
-        return FALSE;
+        /* event is borrowed (gesture) */
+        return;
       }
       else
       {
         gtk_tree_selection_select_path(selection, path);
         dt_lib_gui_queue_update(self);
-        if(button_pressed == GDK_BUTTON_SECONDARY)
+        if(button == GDK_BUTTON_SECONDARY && n_press == 1)
         {
-          _pop_menu_dictionary(view, event, self);
+          dt_gui_claim(gesture);
+          _pop_menu_dictionary(view, (GdkEventButton *)event, self);
           gtk_tree_path_free(path);
-          return TRUE;
+          /* event is borrowed (gesture) */
+          return;
         }
         else if(d->tree_flag
-                && button_pressed == GDK_BUTTON_PRIMARY
+                && button == GDK_BUTTON_PRIMARY && n_press == 1
                 && shift_pressed)
         {
+          dt_gui_claim(gesture);
           gtk_tree_view_expand_row(GTK_TREE_VIEW(view), path, TRUE);
           gtk_tree_path_free(path);
-          return TRUE;
+          /* event is borrowed (gesture) */
+          return;
         }
-        else if(dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS
-                && dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
+        else if(n_press == 2 && button == GDK_BUTTON_PRIMARY)
         {
+          dt_gui_claim(gesture);
           _attach_selected_tag(self, d);
           gtk_tree_path_free(path);
-          return TRUE;
+          /* event is borrowed (gesture) */
+          return;
         }
       }
     }
     gtk_tree_path_free(path);
   }
-  return FALSE;
+  /* event is borrowed (gesture) */
 }
 
-static gboolean _dictionary_key_pressed(GtkWidget *view,
-                                        GdkEventKey *event,
-                                        dt_lib_module_t *self)
+static gboolean _dictionary_key_pressed(GtkEventControllerKey *controller,
+                                         guint keyval,
+                                         guint keycode,
+                                         GdkModifierType state,
+                                         dt_lib_module_t *self)
 {
   dt_lib_tagging_t *d = self->data;
   _unselect_all_in_view(d->attached_view);
   GtkTreeIter iter;
   GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(d->dictionary_view));
+  GtkWidget *view = dt_gui_get_widget(controller);
   GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(view));
   gboolean res = FALSE;
   if(gtk_tree_selection_get_selected(selection, &model, &iter))
   {
     GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
-    switch(dt_gdk_event_get_keyval(event))
+    switch(keyval)
     {
       case GDK_KEY_Return:
       case GDK_KEY_KP_Enter:
       {
         _attach_selected_tag(self, d);
-        if(dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK))
+        if(dt_modifier_is(state, GDK_SHIFT_MASK))
         {
           gtk_tree_selection_unselect_all(selection);
           gtk_entry_set_text(GTK_ENTRY(d->entry), "");
@@ -2736,7 +2815,7 @@ static gboolean _dictionary_key_pressed(GtkWidget *view,
       case GDK_KEY_Left:
         if(path)
         {
-          if(dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK))
+          if(dt_modifier_is(state, GDK_SHIFT_MASK))
             gtk_tree_view_collapse_all(GTK_TREE_VIEW(view));
           else
             gtk_tree_view_collapse_row(GTK_TREE_VIEW(view), path);
@@ -2747,7 +2826,7 @@ static gboolean _dictionary_key_pressed(GtkWidget *view,
         if(path)
         {
           gtk_tree_view_expand_row(GTK_TREE_VIEW(view), path,
-                                   dt_modifier_is(dt_gdk_event_get_state(event), GDK_SHIFT_MASK));
+                                   dt_modifier_is(state, GDK_SHIFT_MASK));
           res = TRUE;
         }
         break;
@@ -2756,12 +2835,12 @@ static gboolean _dictionary_key_pressed(GtkWidget *view,
     }
     gtk_tree_path_free(path);
   }
-  if(dt_gdk_event_get_keyval(event) == GDK_KEY_Tab)
+  if(keyval == GDK_KEY_Tab)
   {
     gtk_tree_selection_unselect_all(selection);
     res = TRUE;
   }
-  else if(dt_gdk_event_get_keyval(event) == GDK_KEY_ISO_Left_Tab)
+  else if(keyval == GDK_KEY_ISO_Left_Tab)
   {
     gtk_tree_selection_unselect_all(selection);
     gtk_widget_grab_focus(GTK_WIDGET(d->entry));
@@ -3529,10 +3608,8 @@ void gui_init(dt_lib_module_t *self)
        "\npress Delete or double-click to detach"
        "\nright-click for other actions on attached tag,"
        "\nTab to give the focus to entry"));
-  g_signal_connect(G_OBJECT(view), "button-press-event",
-                   G_CALLBACK(_click_on_view_attached), (gpointer)self);
-  g_signal_connect(G_OBJECT(view), "key-press-event",
-                   G_CALLBACK(_attached_key_pressed), (gpointer)self);
+  dt_gui_connect_click_all(view, _click_on_view_attached, NULL, self);
+  dt_gui_connect_key(view, _attached_key_pressed, self);
   g_signal_connect(gtk_tree_view_get_selection(view), "changed",
                    G_CALLBACK(_tree_selection_changed), self);
 
@@ -3591,19 +3668,22 @@ void gui_init(dt_lib_module_t *self)
   gtk_widget_add_events(GTK_WIDGET(w), GDK_KEY_RELEASE_MASK);
   g_signal_connect(G_OBJECT(w), "changed",
                    G_CALLBACK(_tag_name_changed), (gpointer)self);
-  g_signal_connect(G_OBJECT(w), "key-press-event",
-                   G_CALLBACK(_enter_key_pressed), (gpointer)self);
+  dt_gui_connect_key(w, _enter_key_pressed, self);
   d->entry = GTK_ENTRY(w);
 
-  button = dtgtk_button_new(dtgtk_cairo_paint_multiply_small, 0, NULL);
-  gtk_widget_set_tooltip_text(button, _("clear entry"));
+  button = dtgtk_button_new_full(dtgtk_cairo_paint_multiply_small, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("clear entry"),
+        .action = DT_ACTION(self),
+        .action_label = N_("clear entry"),
+        .action_def = &dt_action_def_button,
+        .clicked_cb = G_CALLBACK(_clear_entry_button_callback),
+        .clicked_data = (gpointer)self,
+      });
   gtk_box_pack_end(hbox, button, FALSE, TRUE, 0);
-  g_signal_connect(G_OBJECT(button), "clicked",
-                   G_CALLBACK(_clear_entry_button_callback), (gpointer)self);
   gtk_box_pack_start(box, GTK_WIDGET(hbox), FALSE, TRUE, 0);
   dt_gui_add_class(GTK_WIDGET(box), "dt_spacing_sw");
   d->clear_button = button;
-  dt_action_define(DT_ACTION(self), NULL, N_("clear entry"), button, &dt_action_def_button);
 
   // dictionary_view tree view
   view = GTK_TREE_VIEW(gtk_tree_view_new());
@@ -3669,10 +3749,8 @@ void gui_init(dt_lib_module_t *self)
        "\nright-click for other actions on selected tag"
        "\nshift+Tab to give the focus to entry"));
 
-  g_signal_connect(G_OBJECT(view), "button-press-event",
-                   G_CALLBACK(_click_on_view_dictionary), (gpointer)self);
-  g_signal_connect(G_OBJECT(view), "key-press-event",
-                   G_CALLBACK(_dictionary_key_pressed), (gpointer)self);
+  dt_gui_connect_click_all(view, _click_on_view_dictionary, NULL, self);
+  dt_gui_connect_key(view, _dictionary_key_pressed, self);
   gtk_tree_view_set_model(view, GTK_TREE_MODEL(d->dictionary_listfilter));
   g_object_unref(d->dictionary_listfilter);
   g_object_set(G_OBJECT(view), "has-tooltip", TRUE, NULL);
@@ -3766,15 +3844,29 @@ void gui_cleanup(dt_lib_module_t *self)
   self->data = NULL;
 }
 
+static gboolean _lib_tagging_tag_destroy(GtkWidget *widget,
+                                         GdkEvent *event,
+                                         gpointer user_data)
+{
+  gtk_widget_destroy(GTK_WIDGET(user_data));
+  return FALSE;
+}
+
 // http://stackoverflow.com/questions/4631388/transparent-floating-gtkentry
-static gboolean _lib_tagging_tag_key_press(GtkWidget *entry,
-                                           GdkEventKey *event,
-                                           dt_lib_module_t *self)
+static gboolean _lib_tagging_tag_key_press(GtkEventControllerKey *controller,
+                                            guint keyval,
+                                            guint keycode,
+                                            GdkModifierType state,
+                                            dt_lib_module_t *self)
 {
   dt_lib_tagging_t *d = self->data;
-  switch(dt_gdk_event_get_keyval(event))
+  GtkWidget *entry = NULL;
+  switch(keyval)
   {
     case GDK_KEY_Escape:
+      entry = dt_gui_get_widget(controller);
+      g_signal_handlers_disconnect_by_func(entry, G_CALLBACK(_lib_tagging_tag_destroy), 
+                                           d->floating_tag_window);
       g_list_free(d->floating_tag_imgs);
       gtk_widget_destroy(d->floating_tag_window);
       gtk_window_present(GTK_WINDOW(dt_ui_main_window(darktable.gui->ui)));
@@ -3784,6 +3876,9 @@ static gboolean _lib_tagging_tag_key_press(GtkWidget *entry,
     case GDK_KEY_Return:
     case GDK_KEY_KP_Enter:
     {
+      entry = dt_gui_get_widget(controller);
+      g_signal_handlers_disconnect_by_func(entry, G_CALLBACK(_lib_tagging_tag_destroy), 
+                                           d->floating_tag_window);
       dt_gui_cursor_set_busy();
       const gchar *tag = gtk_entry_get_text(GTK_ENTRY(entry));
       const gboolean res = dt_tag_attach_string_list(tag, d->floating_tag_imgs, TRUE);
@@ -3804,14 +3899,6 @@ static gboolean _lib_tagging_tag_key_press(GtkWidget *entry,
     }
   }
   return FALSE; /* event not handled */
-}
-
-static gboolean _lib_tagging_tag_destroy(GtkWidget *widget,
-                                         GdkEvent *event,
-                                         gpointer user_data)
-{
-  gtk_widget_destroy(GTK_WIDGET(user_data));
-  return FALSE;
 }
 
 static void _lib_tagging_tag_redo(dt_action_t *action)
@@ -3895,8 +3982,7 @@ static void _lib_tagging_tag_show(dt_action_t *action)
   gtk_container_add(GTK_CONTAINER(d->floating_tag_window), entry);
   g_signal_connect(entry, "focus-out-event",
                    G_CALLBACK(_lib_tagging_tag_destroy), d->floating_tag_window);
-  g_signal_connect(entry, "key-press-event",
-                   G_CALLBACK(_lib_tagging_tag_key_press), self);
+  dt_gui_connect_key(entry, _lib_tagging_tag_key_press, self);
 
   gtk_widget_show_all(d->floating_tag_window);
   gtk_widget_grab_focus(entry);
@@ -3973,9 +4059,12 @@ static void _size_recent_tags_list()
   }
 }
 
-void _menuitem_preferences(GtkMenuItem *menuitem,
-                           dt_lib_module_t *self)
+static void _menuitem_preferences(GSimpleAction *action,
+                                  GVariant *parameter,
+                                  gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+
   GtkWidget *win = dt_ui_main_window(darktable.gui->ui);
   GtkWidget *dialog = gtk_dialog_new_with_buttons(_("tagging settings"), GTK_WINDOW(win),
                                                   GTK_DIALOG_DESTROY_WITH_PARENT,
@@ -4001,11 +4090,12 @@ void _menuitem_preferences(GtkMenuItem *menuitem,
   }
 }
 
-void set_preferences(void *menu, dt_lib_module_t *self)
+void set_preferences(GMenu *menu, GActionGroup *action_group, dt_lib_module_t *self)
 {
-  GtkWidget *mi = gtk_menu_item_new_with_label(_("preferences..."));
-  g_signal_connect(G_OBJECT(mi), "activate", G_CALLBACK(_menuitem_preferences), self);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+  GSimpleAction *action = g_simple_action_new("preferences", NULL);
+  g_signal_connect(action, "activate", G_CALLBACK(_menuitem_preferences), self);
+  g_action_map_add_action(G_ACTION_MAP(action_group), G_ACTION(action));
+  g_menu_append(menu, _("preferences..."), "presets.preferences");
 }
 
 static void _save_last_tag_used(const char *tagnames,

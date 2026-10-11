@@ -16,6 +16,7 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "common/dtdata.h"
 #include "common/history.h"
 #include "common/collection.h"
 #include "common/darktable.h"
@@ -964,6 +965,15 @@ gboolean dt_history_copy_and_paste_on_image(const dt_imgid_t imgid,
     ? _history_copy_and_paste_on_image_merge(imgid, dest_imgid, ops, copy_iop_order, copy_full)
     : _history_copy_and_paste_on_image_overwrite(imgid, dest_imgid, ops, copy_iop_order, copy_full);
 
+  // params travel verbatim, so raster entries they reference must too;
+  // a failure is reported, not unwound: the masks just render empty
+  if(!dt_dtdata_merge(imgid, dest_imgid))
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[dt_history_copy_and_paste_on_image] raster masks of image %d"
+             " could not be copied to image %d", imgid, dest_imgid);
+    dt_control_log(_("raster masks could not be copied to the pasted history"));
+  }
+
   if(iop_list)
   {
     dt_ioppr_write_iop_order_list(iop_list, dest_imgid);
@@ -1469,6 +1479,8 @@ gboolean dt_history_compress(const dt_imgid_t imgid)
     dt_image_set_history_end(imgid, done);
 
     dt_image_write_sidecar_file(imgid);
+    // no undo on this path, so entries the compressed history dropped are final
+    dt_dtdata_sweep(imgid);
   }
   dt_unlock_image(imgid);
   dt_history_hash_write_from_history(imgid, DT_HISTORY_HASH_CURRENT);
@@ -1651,6 +1663,41 @@ static gsize _history_hash_compute_from_db(const dt_imgid_t imgid,
         const char *buf = (char *)sqlite3_column_text(stmt, 1);
         if(buf) g_checksum_update(checksum, (const guchar *)buf, -1);
       }
+    }
+    sqlite3_finalize(stmt);
+
+    // masks (main.masks_history): shape/group state -- points, the inversion
+    // bit, refinements, ... -- lives here, not in blendop_params, so it must
+    // be hashed too or a mask-only edit (move/resize/invert a shape, change
+    // a group's operator, ...) leaves this hash unchanged and the stale
+    // lighttable thumbnail is never regenerated (see
+    // dt_history_hash_is_mipmap_synced). Same "latest row per formid, up to
+    // history_end" read dt_masks_read_masks_history uses, so this tracks
+    // exactly what darkroom would actually render.
+    // clang-format off
+    DT_DEBUG_SQLITE3_PREPARE_V2
+      (dt_database_get(darktable.db),
+       "SELECT form, points, points_count, source, MAX(num)"
+       " FROM main.masks_history"
+       " WHERE imgid = ?1 AND num < ?2"
+       " GROUP BY formid"
+       " ORDER BY formid",
+       -1, &stmt, NULL);
+    // clang-format on
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+    DT_DEBUG_SQLITE3_BIND_INT(stmt, 2, history_end);
+    while(sqlite3_step(stmt) == SQLITE_ROW)
+    {
+      const int form_type = sqlite3_column_int(stmt, 0);
+      g_checksum_update(checksum, (const guchar *)&form_type, sizeof(form_type));
+      const guchar *buf = sqlite3_column_blob(stmt, 1);
+      int len = sqlite3_column_bytes(stmt, 1);
+      if(buf) g_checksum_update(checksum, buf, len);
+      const int points_count = sqlite3_column_int(stmt, 2);
+      g_checksum_update(checksum, (const guchar *)&points_count, sizeof(points_count));
+      buf = sqlite3_column_blob(stmt, 3);
+      len = sqlite3_column_bytes(stmt, 3);
+      if(buf) g_checksum_update(checksum, buf, len);
     }
     sqlite3_finalize(stmt);
 
@@ -1848,6 +1895,22 @@ void dt_history_hash_set_mipmap(const dt_imgid_t imgid)
   sqlite3_finalize(stmt);
 }
 
+void dt_history_hash_unset_mipmap(const dt_imgid_t imgid)
+{
+  if(!dt_is_valid_imgid(imgid)) return;
+  sqlite3_stmt *stmt;
+  // clang-format off
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
+                              "UPDATE main.history_hash"
+                              " SET mipmap_hash = 0"
+                              " WHERE imgid = ?1",
+                              -1, &stmt, NULL);
+  // clang-format on
+  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
+  sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+}
+
 dt_history_hash_t dt_history_hash_get_status(const dt_imgid_t imgid)
 {
   dt_history_hash_t status = DT_HISTORY_HASH_NONE;
@@ -1888,7 +1951,13 @@ gboolean dt_history_copy(const dt_imgid_t imgid)
   if(!dt_is_valid_imgid(imgid)) return FALSE;
 
   darktable.view_manager->copy_paste.copied_imageid = imgid;
+  // a plain copy of the whole stack still has to skip the modules flagged as
+  // unsafe to copy, see dt_history_module_skip_copy(). Only a duplicate of the
+  // same image, where copy_full is passed explicitly, copies everything.
   darktable.view_manager->copy_paste.full_copy = FALSE;
+
+  // in full copy mode, we also copy the module iop order
+  darktable.view_manager->copy_paste.copy_iop_order = TRUE;
 
   if(darktable.view_manager->copy_paste.selops)
   {
@@ -1907,7 +1976,8 @@ gboolean dt_history_copy_parts(const dt_imgid_t imgid)
 {
   if(dt_history_copy(imgid))
   {
-    // we want to copy all history and let user select the parts needed
+    // the user picks the modules in the dialog, so let anything they
+    // tick through.
     darktable.view_manager->copy_paste.full_copy = TRUE;
 
     // run dialog, it will insert into selops the selected module

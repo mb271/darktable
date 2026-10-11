@@ -1,6 +1,6 @@
 /*
    This file is part of darktable,
-   Copyright (C) 2009-2025 darktable developers.
+   Copyright (C) 2009-2026 darktable developers.
 
    darktable is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -24,10 +24,10 @@
 #include "common/tags.h"
 #include "control/conf.h"
 #include "control/control.h"
+#include "control/crawler.h"
 #include "control/jobs.h"
 #include "views/view.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -38,17 +38,19 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
 #ifdef USE_LUA
 #include "lua/glist.h"
 #include "lua/lua.h"
 #endif
+
 #ifdef GDK_WINDOWING_QUARTZ
 #include "osx/osx.h"
 #endif
 
 void dt_film_init(dt_film_t *film)
 {
-  dt_pthread_mutex_init(&film->images_mutex, NULL);
+  dt_pthread_mutex_init(&film->images_mutex);
   film->last_loaded = film->num_images = 0;
   film->dirname[0] = '\0';
   film->dir = NULL;
@@ -163,6 +165,13 @@ gboolean dt_film_open(const dt_filmid_t id)
     sqlite3_step(stmt);
   }
   sqlite3_finalize(stmt);
+
+  // the user is about to look at this film roll, so make sure its sidecar
+  // files have been checked before its images can be edited.  this waits,
+  // but only for this one film roll rather than for the whole library,
+  // and only until the background crawl has reached it.
+  dt_control_crawler_ensure_filmroll(id);
+
   // TODO: prefetch to cache using image_open
   dt_film_set_query(id);
   dt_control_queue_redraw_center();

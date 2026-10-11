@@ -63,7 +63,7 @@ const char **description(dt_iop_module_t *self)
 
 int flags()
 {
-  return IOP_FLAGS_INCLUDE_IN_STYLES | IOP_FLAGS_SUPPORTS_BLENDING;
+  return IOP_FLAGS_INCLUDE_IN_STYLES | IOP_FLAGS_SUPPORTS_BLENDING | IOP_FLAGS_ALLOW_TILING;
 }
 
 int default_group()
@@ -1427,7 +1427,7 @@ static gboolean _agx_draw_curve(GtkWidget *widget,
 
   cairo_surface_t *cst = dt_cairo_image_surface_create(CAIRO_FORMAT_ARGB32, g->allocation.width,
                                                        g->allocation.height);
-  PangoFontDescription *desc = pango_font_description_copy_static(darktable.bauhaus->pango_font_desc);
+  PangoFontDescription *desc = dt_gui_get_font();
   cairo_t *cr = cairo_create(cst);
   PangoLayout *layout = pango_cairo_create_layout(cr);
 
@@ -2071,23 +2071,33 @@ static void _add_exposure_box(dt_iop_module_t *self, dt_iop_agx_gui_data_t *g, d
   GtkWidget *auto_tune_label = dt_ui_label_new(_("auto tune levels"));
   g->range_exposure_picker = dt_color_picker_new(self, DT_COLOR_PICKER_AREA | DT_COLOR_PICKER_DENOISE, NULL);
   gtk_widget_set_tooltip_text(g->range_exposure_picker, _("set black and white relative exposure using the selected area"));
-  dt_action_define_iop(real_self, N_("exposure range"), N_("auto tune levels"), g->range_exposure_picker, &dt_action_def_toggle);
+  dt_action_define_iop(real_self, N_("exposure range"), N_("auto tune levels"), g->range_exposure_picker, &dt_action_def_color_picker);
   dt_gui_box_add(auto_tune_box, dt_gui_expand(auto_tune_label), g->range_exposure_picker);
   dt_gui_box_add(g->range_exposure_picker_group, auto_tune_box);
 
-  g->btn_read_exposure = dtgtk_button_new(dtgtk_cairo_paint_camera, 0, NULL);
-  gtk_widget_set_tooltip_text(g->btn_read_exposure, _("read exposure from metadata and exposure module"));
-  g_signal_connect(G_OBJECT(g->btn_read_exposure), "clicked", G_CALLBACK(_read_exposure_params_callback), real_self);
-  dt_action_define_iop(real_self, N_("exposure range"), N_("read exposure"), g->btn_read_exposure, &dt_action_def_button);
+  g->btn_read_exposure = dtgtk_button_new_full(dtgtk_cairo_paint_camera, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("read exposure from metadata and exposure module"),
+        .action = DT_ACTION(real_self),
+        .action_section = N_("exposure range"),
+        .action_label = N_("read exposure"),
+        .action_def = &dt_action_def_button,
+        .clicked_cb = G_CALLBACK(_read_exposure_params_callback),
+        .clicked_data = real_self,
+      });
   dt_gui_box_add(g->range_exposure_picker_group, g->btn_read_exposure);
 
   dt_gui_box_add(self->widget, g->range_exposure_picker_group);
 }
 
-static void _apply_primaries_from_menu_callback(GtkMenuItem *menuitem, dt_iop_module_t *self)
+static void _apply_primaries_from_menu_callback(GSimpleAction *action,
+                                                GVariant *parameter,
+                                                gpointer user_data)
 {
-  const char *preset_id = gtk_widget_get_name(GTK_WIDGET(menuitem));
+  dt_iop_module_t *self = (dt_iop_module_t *)user_data;
   dt_iop_agx_params_t *p = self->params;
+
+  const gchar *preset_id = g_variant_get_string(parameter, NULL);
 
   if(strcmp(preset_id, "blender") == 0) _set_blenderlike_primaries(p);
   else if(strcmp(preset_id, "smooth") == 0) _set_smooth_primaries(p);
@@ -2097,27 +2107,35 @@ static void _apply_primaries_from_menu_callback(GtkMenuItem *menuitem, dt_iop_mo
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 }
 
-static void _primaries_popupmenu_callback(GtkWidget *button, dt_iop_module_t *self)
+static void _primaries_popupmenu_callback(GtkWidget *button,
+                                          dt_iop_module_t *self)
 {
-  GtkWidget *menu = gtk_menu_new();
+  GActionGroup *action_group = gtk_widget_get_action_group(button, "agx-primaries");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "activate", _apply_primaries_from_menu_callback, "s", NULL }
+    };
 
-  GtkWidget *blender_item = gtk_menu_item_new_with_mnemonic(_("blender-like"));
-  gtk_widget_set_name(blender_item, "blender");
-  g_signal_connect(blender_item, "activate", G_CALLBACK(_apply_primaries_from_menu_callback), self);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), blender_item);
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(button,
+                                   "agx-primaries",
+                                   G_ACTION_GROUP(action_group));
+  }
 
-  GtkWidget *smooth_item = gtk_menu_item_new_with_mnemonic(_("smooth"));
-  gtk_widget_set_name(smooth_item, "smooth");
-  g_signal_connect(smooth_item, "activate", G_CALLBACK(_apply_primaries_from_menu_callback), self);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), smooth_item);
-
-  GtkWidget *unmodified_item = gtk_menu_item_new_with_mnemonic(_("unmodified"));
-  gtk_widget_set_name(unmodified_item, "unmodified");
-  g_signal_connect(unmodified_item, "activate", G_CALLBACK(_apply_primaries_from_menu_callback), self);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), unmodified_item);
-
-  gtk_widget_show_all(menu);
-  dt_gui_menu_popup(GTK_MENU(menu), button, GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST);
+  GMenu *menu = g_menu_new();
+  g_menu_append(menu, _("blender-like"), "agx-primaries.activate::blender");
+  g_menu_append(menu, _("smooth"), "agx-primaries.activate::smooth");
+  g_menu_append(menu, _("unmodified"), "agx-primaries.activate::unmodified");
+  
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(button, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
 static void _set_post_curve_primaries_from_pre_callback(GtkWidget *widget, dt_iop_module_t *self)
@@ -2241,12 +2259,12 @@ void gui_update(dt_iop_module_t *self)
 
   _update_pivot_slider_settings(g->basic_curve_controls.curve_pivot_x, p);
 
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->auto_gamma),
-                               p->auto_gamma);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->disable_primaries_adjustments),
-                               p->disable_primaries_adjustments);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->completely_reverse_primaries),
-                               p->completely_reverse_primaries);
+  dt_bauhaus_toggle_set(g->auto_gamma,
+                        p->auto_gamma);
+  dt_bauhaus_toggle_set(g->disable_primaries_adjustments,
+                        p->disable_primaries_adjustments);
+  dt_bauhaus_toggle_set(g->completely_reverse_primaries,
+                        p->completely_reverse_primaries);
 
   _update_redraw_dynamic_gui(self, g, p);
 
@@ -2277,11 +2295,15 @@ static void _create_primaries_page(dt_iop_module_t *main,
        "especially with bright, saturated lights (e.g. LEDs).\n"
        "mainly intended to be used for experimenting."));
 
-  GtkWidget *primaries_button = dtgtk_button_new(dtgtk_cairo_paint_styles, 0, NULL);
-  gtk_widget_set_tooltip_text(primaries_button, _("reset primaries to a predefined configuration"));
-  g_signal_connect(primaries_button, "clicked", G_CALLBACK(_primaries_popupmenu_callback), main);
-  dt_action_define_iop(main, NULL, N_("reset primaries"),
-                       primaries_button, &dt_action_def_button);
+  GtkWidget *primaries_button = dtgtk_button_new_full(dtgtk_cairo_paint_styles, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("reset primaries to a predefined configuration"),
+        .action = DT_ACTION(main),
+        .action_label = N_("reset primaries"),
+        .action_def = &dt_action_def_button,
+        .clicked_cb = G_CALLBACK(_primaries_popupmenu_callback),
+        .clicked_data = main,
+      });
 
   g->primaries_controls_vbox = dt_gui_vbox(dt_gui_hbox(dt_ui_label_new(_("reset primaries")),
                                                        dt_gui_align_right(primaries_button)));

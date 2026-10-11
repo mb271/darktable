@@ -20,6 +20,8 @@
 
 #include "develop/blend.h"
 
+#include <sqlite3.h>
+
 // format flags stored into the presets database; the FOR_NOT_
 // variants are negated to keep existing presets
 typedef enum dt_gui_presets_format_flag_t
@@ -139,7 +141,38 @@ void dt_gui_presets_update_filter(const char *name,
                                   const int filter);
 
 /** show the popup menu for the given module, with default behavior. */
-GtkMenu *dt_gui_presets_popup_menu_show_for_module(dt_iop_module_t *module);
+void dt_gui_presets_popup_menu_show_for_module(GtkWidget *button, dt_iop_module_t *module);
+
+/** ops for building a preset popup menu (dt_gui_presets_popup_menu_show()).
+ *  The SELECT returned by query() must start with the columns
+ *  name, op_params, writeprotect, description; extra columns may follow and
+ *  are read from the live statement inside the callbacks. */
+typedef struct dt_gui_presets_menu_ops_t
+{
+  gpointer data;                     /* caller context, passed to every callback */
+  const gchar *hide_defaults_pref;   /* conf key: which default presets to hide */
+  gchar *(*query)(gpointer data);    /* build the SELECT string */
+  void (*bind)(sqlite3_stmt *stmt, gpointer data); /* bind the WHERE parameters */
+  gboolean (*is_default)(sqlite3_stmt *stmt, gpointer data);   /* dimmed built-in; NULL = none */
+  gboolean (*is_disabled)(sqlite3_stmt *stmt, gpointer data);  /* greyed out (wrong op version); NULL = none */
+  gboolean (*is_active)(sqlite3_stmt *stmt, gpointer data,
+                        gboolean *writeprotect);               /* highlighted current-params match */
+  int params_size;               /* 0 disables "store new preset" */
+  void *activate_cb;             /* activate preset */
+  void *manage_cb;               /* "manage presets..." item; NULL = none */
+  void *edit_cb;                 /* "edit this preset.." */
+  void *del_cb;                  /* "delete this preset" */
+  void *store_cb;                /* "store new preset.." */
+  void *update_cb;               /* "update preset" */
+  void (*prefs)(GMenu *menu, gpointer data); /* trailing prefs section; NULL = none */
+} dt_gui_presets_menu_ops_t;
+
+/** build the shared preset popup menu (the iop darkroom and lib header/
+ *  modulegroups presets menus are the same menu).  The caller owns popping
+ *  the menu up and any per-menu destroy cleanup; the menu is not popped and
+ *  not destroyed here. */
+GtkWidget *dt_gui_presets_popup_menu_show(GtkWidget *button,
+                                          const dt_gui_presets_menu_ops_t *ops);
 
 /** show popupmenu for favorite modules */
 void dt_gui_favorite_presets_menu_show(GtkWidget *w);

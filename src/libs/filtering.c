@@ -25,12 +25,16 @@
 #include "control/jobs.h"
 #include "dtgtk/button.h"
 #include "dtgtk/range.h"
+#include "dtgtk/rating_stars.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "libs/collect.h"
 #include "libs/lib.h"
 #include "libs/lib_api.h"
 #include "views/view.h"
+#include <glib-2.0/gio/gio.h>
+#include <glib-2.0/gio/gmenu.h>
+#include <glib-2.0/glib-object.h>
 #ifndef _WIN32
 #include <gio/gunixmounts.h>
 #endif
@@ -189,7 +193,7 @@ static void _rule_set_raw_text(dt_lib_filtering_rule_t *rule, const gchar *text,
 
 static void _range_changed(GtkWidget *widget, gpointer user_data);
 static void _range_widget_add_to_rule(dt_lib_filtering_rule_t *rule, _widgets_range_t *special, const gboolean top);
-static void _sort_append_sort(GtkWidget *widget, dt_lib_module_t *self);
+static void _sort_append_sort(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 
 typedef void (*_widget_init_func)(dt_lib_filtering_rule_t *rule, const dt_collection_properties_t prop,
                                   const gchar *text, dt_lib_module_t *self, gboolean top);
@@ -242,6 +246,7 @@ static _filter_t filters[]
         { DT_COLLECTION_PROP_EXPOSURE_BIAS, _exposure_bias_widget_init, _exposure_bias_update },
         { DT_COLLECTION_PROP_GROUP_ID, _misc_widget_init, _misc_update },
         { DT_COLLECTION_PROP_DUPLICATES, _duplicates_widget_init, _duplicates_update },
+        { DT_COLLECTION_PROP_DIMENSIONS, _misc_widget_init, _misc_update },
         { DT_COLLECTION_PROP_LOCAL_COPY, _local_copy_widget_init, _local_copy_update },
         { DT_COLLECTION_PROP_HISTORY, _history_widget_init, _history_update },
         { DT_COLLECTION_PROP_ORDER, _module_order_widget_init, _module_order_update },
@@ -816,12 +821,23 @@ static void _event_rule_change_type(GtkWidget *widget, dt_lib_module_t *self)
                                     darktable.view_manager->proxy.module_collect.module);
 }
 
-static void _event_append_rule(GtkWidget *widget, dt_lib_module_t *self)
+static void _event_append_rule(GSimpleAction *action,
+                               GVariant *parameter,
+                               gpointer user_data)
 {
-  // add new rule
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_filtering_t *d = self->data;
-  const int mode = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "collect_id"));
-  const int top = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "topbar"));
+
+  GVariant *v_mode = g_variant_get_child_value(parameter, 0);
+  GVariant *v_top  = g_variant_get_child_value(parameter, 1);
+
+  // add new rule
+  const int mode = g_variant_get_int32(v_mode);
+  const int top  = g_variant_get_int32(v_top);
+
+  g_variant_unref(v_mode);
+  g_variant_unref(v_top);
+
   char confname[200] = { 0 };
 
   if(mode >= 0)
@@ -850,87 +866,123 @@ static void _event_append_rule(GtkWidget *widget, dt_lib_module_t *self)
   }
 }
 
-static void _popup_add_item(GtkMenuShell *pop, const gchar *name, const int id, const gboolean title,
-                            GCallback callback, gpointer data, dt_lib_module_t *self, const float xalign)
+static void _popup_add_sort_item(GMenu *menu,
+                                 const gchar *name,
+                                 const int id)
 {
-  // we first verify that the filter is defined
-  if(callback != G_CALLBACK(_sort_append_sort) && !title && !_filters_get(id)) return;
-
-  GtkWidget *smt = gtk_menu_item_new_with_label(name);
-  if(title)
-  {
-    GtkWidget *child = gtk_bin_get_child(GTK_BIN(smt));
-    gtk_label_set_xalign(GTK_LABEL(child), xalign);
-    gtk_widget_set_sensitive(smt, FALSE);
-  }
-  else
-  {
-    GtkWidget *child = gtk_bin_get_child(GTK_BIN(smt));
-    gtk_label_set_xalign(GTK_LABEL(child), xalign);
-    g_object_set_data(G_OBJECT(smt), "collect_id", GINT_TO_POINTER(id));
-    g_object_set_data(G_OBJECT(smt), "topbar", GINT_TO_POINTER(0));
-    if(data) g_object_set_data(G_OBJECT(smt), "collect_data", data);
-    g_signal_connect_data(G_OBJECT(smt), "activate", callback, self, NULL, 0);
-  }
-  gtk_menu_shell_append(pop, smt);
+  GMenuItem *item = g_menu_item_new(name, NULL);
+  g_menu_item_set_action_and_target_value(item,
+                                          "sort.activate",
+                                          g_variant_new("i", id, 0));
+  g_menu_append_item(menu, item);
+  g_object_unref(item);
 }
 
-static gboolean _rule_show_popup(GtkWidget *widget, dt_lib_filtering_rule_t *rule, dt_lib_module_t *self)
+static void _popup_add_filter_item(GMenu *menu,
+                                   const gchar *name,
+                                   const int id,
+                                   gpointer data)
 {
+  if(!_filters_get(id)) return;
+
+  GMenuItem *item = g_menu_item_new(name, NULL);
+  g_menu_item_set_action_and_target_value(item,
+                                          "filter.activate",
+                                          g_variant_new("(ii)", id, 0));
+  g_menu_append_item(menu, item);
+  g_object_unref(item);
+}
+
+static gboolean _rule_show_popup(GtkWidget *widget,
+                                 dt_lib_filtering_rule_t *rule,
+                                 dt_lib_module_t *self)
+{
+  GActionGroup *action_group = gtk_widget_get_action_group(widget, "filter");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "activate", _event_append_rule, "(ii)", NULL },
+    };
+
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(widget, 
+                                   "filter",
+                                   G_ACTION_GROUP(action_group));
+  }
+
 #define ADD_COLLECT_ENTRY(menu, value)                                                                            \
-  _popup_add_item(menu, dt_collection_name(value), value, FALSE, G_CALLBACK(_event_append_rule), rule, self, 0.5);
+  _popup_add_filter_item(menu, dt_collection_name(value), value, rule);
 
   // we show a popup with all the possible rules
   // note that only rules with defined filters will be shown
-  GtkMenuShell *spop = GTK_MENU_SHELL(gtk_menu_new());
-  gtk_widget_set_size_request(GTK_WIDGET(spop), 200, -1);
+  GMenu *menu = g_menu_new();
+  GMenu *section;
 
   // the different categories
-  _popup_add_item(spop, _("files"), 0, TRUE, NULL, NULL, self, 0.0);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_FILMROLL);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_FOLDERS);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_FILENAME);
+  section = g_menu_new();
+  g_menu_append_section(menu, _("files"), G_MENU_MODEL(section));
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_FILMROLL);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_FOLDERS);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_FILENAME);
+  g_object_unref(section);
 
-  _popup_add_item(spop, _("metadata"), 0, TRUE, NULL, NULL, self, 0.0);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_TAG);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_RATING_RANGE);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_RATING);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_COLORLABEL);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_TEXTSEARCH);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_GEOTAGGING);
+  section = g_menu_new();
+  g_menu_append_section(menu, _("metadata"), G_MENU_MODEL(section));
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_TAG);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_RATING_RANGE);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_RATING);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_COLORLABEL);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_TEXTSEARCH);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_GEOTAGGING);
+  g_object_unref(section);
 
-  _popup_add_item(spop, _("times"), 0, TRUE, NULL, NULL, self, 0.0);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_DAY);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_MONTH);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_TIME);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_IMPORT_TIMESTAMP);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_CHANGE_TIMESTAMP);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_EXPORT_TIMESTAMP);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_PRINT_TIMESTAMP);
+  section = g_menu_new();
+  g_menu_append_section(menu, _("times"), G_MENU_MODEL(section));
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_DAY);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_MONTH);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_TIME);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_IMPORT_TIMESTAMP);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_CHANGE_TIMESTAMP);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_EXPORT_TIMESTAMP);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_PRINT_TIMESTAMP);
+  g_object_unref(section);
 
-  _popup_add_item(spop, _("capture details"), 0, TRUE, NULL, NULL, self, 0.0);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_CAMERA);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_LENS);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_APERTURE);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_EXPOSURE);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_EXPOSURE_BIAS);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_FOCAL_LENGTH);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_ISO);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_ASPECT_RATIO);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_WHITEBALANCE);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_FLASH);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_EXPOSURE_PROGRAM);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_METERING_MODE);
+  section = g_menu_new();
+  g_menu_append_section(menu, _("capture details"), G_MENU_MODEL(section));
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_CAMERA);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_LENS);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_APERTURE);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_EXPOSURE);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_EXPOSURE_BIAS);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_FOCAL_LENGTH);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_ISO);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_ASPECT_RATIO);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_WHITEBALANCE);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_FLASH);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_EXPOSURE_PROGRAM);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_METERING_MODE);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_DIMENSIONS);
+  g_object_unref(section);
 
-  _popup_add_item(spop, _("darktable"), 0, TRUE, NULL, NULL, self, 0.0);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_GROUP_ID);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_DUPLICATES);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_LOCAL_COPY);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_HISTORY);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_MODULE);
-  ADD_COLLECT_ENTRY(spop, DT_COLLECTION_PROP_ORDER);
+  section = g_menu_new();
+  g_menu_append_section(menu, _("darktable"), G_MENU_MODEL(section));
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_GROUP_ID);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_DUPLICATES);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_LOCAL_COPY);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_HISTORY);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_MODULE);
+  ADD_COLLECT_ENTRY(section, DT_COLLECTION_PROP_ORDER);
+  g_object_unref(section);
 
-  dt_gui_menu_popup(GTK_MENU(spop), widget, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH);
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(widget, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
+
   return TRUE;
 #undef ADD_COLLECT_ENTRY
 }
@@ -982,6 +1034,7 @@ static void _populate_rules_combo(GtkWidget *w)
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_FLASH);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_EXPOSURE_PROGRAM);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_METERING_MODE);
+  ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_DIMENSIONS);
 
   dt_bauhaus_combobox_add_section(w, _("darktable"));
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_GROUP_ID);
@@ -1033,27 +1086,24 @@ static void _topbar_reset(dt_lib_module_t *self)
   dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD, DT_COLLECTION_PROP_UNDEF, NULL);
 }
 
-static gboolean _topbar_reset_press(GtkWidget *w,
-                                    GdkEventButton *e,
-                                    dt_lib_module_t *self)
+static void _topbar_reset_press_cb(GtkGestureSingle *gesture, int n_press,
+                                      double x, double y,
+                                      dt_lib_module_t *self)
 {
   //reset the filters
   _topbar_reset(self);
   //close the popup
   dt_lib_filtering_t *d = self->data;
   gtk_widget_destroy(d->topbar_popup);
-
-  return FALSE;
 }
 
-static gboolean _topbar_label_press(GtkWidget *w,
-                                    GdkEventButton *e,
-                                    dt_lib_module_t *self)
+static void _topbar_label_press_cb(GtkGestureSingle *gesture, int n_press,
+                                      double x, double y,
+                                      dt_lib_module_t *self)
 {
   //reset on double-click
-  if(e->button == GDK_BUTTON_PRIMARY && e->type == GDK_2BUTTON_PRESS)
+  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_PRIMARY && n_press >= 2)
     _topbar_reset(self);
-  return FALSE;
 }
 
 static void _topbar_update(dt_lib_module_t *self)
@@ -1088,7 +1138,7 @@ static void _topbar_update(dt_lib_module_t *self)
         GtkWidget *evtb = gtk_event_box_new();
         GtkWidget *label = gtk_label_new(C_("quickfilter", "filter"));
         gtk_container_add(GTK_CONTAINER(evtb), label);
-        g_signal_connect(G_OBJECT(evtb), "button-press-event", G_CALLBACK(_topbar_label_press), self);
+        dt_gui_connect_click_all(evtb, _topbar_label_press_cb, NULL, self);
         gtk_box_pack_start(GTK_BOX(fbox), evtb, TRUE, TRUE, 0);
         gtk_widget_show_all(evtb);
       }
@@ -1163,56 +1213,57 @@ static void _event_rule_disable(GtkWidget *widget, dt_lib_filtering_rule_t *rule
   _widget_header_update(rule);
 }
 
-static gboolean _event_rule_close(GtkWidget *widget, GdkEventButton *event, dt_lib_module_t *self)
+static void _rule_remove_config_entries(dt_lib_module_t *self, dt_lib_filtering_rule_t *rule)
 {
+  dt_lib_filtering_t *d = rule->lib;
+  if(d->nb_rules <= 0) return;
+  d->nb_rules--;
+  dt_conf_set_int("plugins/lighttable/filtering/num_rules", d->nb_rules);
+
+  // move up all still active rules by one.
+  for(int i = rule->num; i < DT_COLLECTION_MAX_RULES - 1; i++)
+  {
+    char confname[200] = { 0 };
+    snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/mode%1d", i + 1);
+    const int mode = dt_conf_get_int(confname);
+    snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/item%1d", i + 1);
+    const int item = dt_conf_get_int(confname);
+    snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/off%1d", i + 1);
+    const int off = dt_conf_get_int(confname);
+    snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/top%1d", i + 1);
+    const int top = dt_conf_get_int(confname);
+    snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/string%1d", i + 1);
+    gchar *string = dt_conf_get_string(confname);
+    if(string)
+    {
+      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/mode%1d", i);
+      dt_conf_set_int(confname, mode);
+      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/item%1d", i);
+      dt_conf_set_int(confname, item);
+      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/off%1d", i);
+      dt_conf_set_int(confname, off);
+      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/top%1d", i);
+      dt_conf_set_int(confname, top);
+      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/string%1d", i);
+      dt_conf_set_string(confname, string);
+      g_free(string);
+    }
+  }
+
+  _filters_gui_update(self);
+  dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD, rule->prop, NULL);
+}
+
+static void _event_rule_close_cb(GtkGestureSingle *gesture, int n_press,
+                                    double x, double y,
+                                    dt_lib_module_t *self)
+{
+  GtkWidget *widget = dt_gui_get_widget(gesture);
   dt_lib_filtering_rule_t *rule = (dt_lib_filtering_rule_t *)g_object_get_data(G_OBJECT(widget), "rule");
-  if(rule->manual_widget_set) return TRUE;
+  if(rule->manual_widget_set) return;
 
   if(!rule->topbar)
-  {
-    // decrease the nb of active rules
-    dt_lib_filtering_t *d = rule->lib;
-    if(d->nb_rules <= 0) return FALSE;
-    d->nb_rules--;
-    dt_conf_set_int("plugins/lighttable/filtering/num_rules", d->nb_rules);
-
-    // move up all still active rules by one.
-    for(int i = rule->num; i < DT_COLLECTION_MAX_RULES - 1; i++)
-    {
-      char confname[200] = { 0 };
-      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/mode%1d", i + 1);
-      const int mode = dt_conf_get_int(confname);
-      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/item%1d", i + 1);
-      const int item = dt_conf_get_int(confname);
-      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/off%1d", i + 1);
-      const int off = dt_conf_get_int(confname);
-      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/top%1d", i + 1);
-      const int top = dt_conf_get_int(confname);
-      snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/string%1d", i + 1);
-      gchar *string = dt_conf_get_string(confname);
-      if(string)
-      {
-        snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/mode%1d", i);
-        dt_conf_set_int(confname, mode);
-        snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/item%1d", i);
-        dt_conf_set_int(confname, item);
-        snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/off%1d", i);
-        dt_conf_set_int(confname, off);
-        snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/top%1d", i);
-        dt_conf_set_int(confname, top);
-        snprintf(confname, sizeof(confname), "plugins/lighttable/filtering/string%1d", i);
-        dt_conf_set_string(confname, string);
-        g_free(string);
-      }
-    }
-
-    _filters_gui_update(self);
-    dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD, rule->prop, NULL);
-  }
-  else
-    return FALSE;
-
-  return TRUE;
+    _rule_remove_config_entries(self, rule);
 }
 
 static gboolean _rule_available_for_topbar(const dt_collection_properties_t prop)
@@ -1308,7 +1359,7 @@ static gboolean _widget_init(dt_lib_filtering_rule_t *rule, const dt_collection_
     // remove button
     rule->w_close = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
     g_object_set_data(G_OBJECT(rule->w_close), "rule", rule);
-    g_signal_connect(G_OBJECT(rule->w_close), "button-press-event", G_CALLBACK(_event_rule_close), self);
+    dt_gui_connect_click_all(rule->w_close, _event_rule_close_cb, NULL, self);
     gtk_box_pack_end(GTK_BOX(rule->w_btn_box), rule->w_close, FALSE, FALSE, 0);
   }
 
@@ -1474,7 +1525,7 @@ static void _history_pretty_print(const char *buf, char *out, size_t outsize)
   while(buf[0] != '\0' && buf[0] != ':') buf++;
   if(buf[0] == ':') buf++;
 
-  for(int k = 0; k < num_rules; k++)
+for(int k = 0; k < num_rules; k++)
   {
     const int n = sscanf(buf, "%d:%d:%d:%d:%399[^$]", &mode, &item, &off, &top, str);
 
@@ -1482,7 +1533,7 @@ static void _history_pretty_print(const char *buf, char *out, size_t outsize)
     {
       if(k > 0)
       {
-        c = g_strlcpy(out, "<i>   ", outsize);
+        c = g_strlcpy(out, "   ", outsize);
         out += c;
         outsize -= c;
         switch(mode)
@@ -1503,7 +1554,7 @@ static void _history_pretty_print(const char *buf, char *out, size_t outsize)
             outsize -= c;
             break;
         }
-        c = g_strlcpy(out, "   </i>", outsize);
+        c = g_strlcpy(out, "   ", outsize);
         out += c;
         outsize -= c;
       }
@@ -1519,16 +1570,16 @@ static void _history_pretty_print(const char *buf, char *out, size_t outsize)
       else if(!g_strcmp0(str, "%"))
         pretty = g_strdup(_("all"));
       else
-        pretty = g_markup_escape_text(str, -1);
+        pretty = g_strdup(str);
 
       if(off)
       {
-        c = snprintf(out, outsize, "<b>%s</b>%s %s",
+        c = snprintf(out, outsize, "%s %s %s",
                      item < DT_COLLECTION_PROP_LAST ? dt_collection_name(item) : "???", _(" (off)"), pretty);
       }
       else
       {
-        c = snprintf(out, outsize, "<b>%s</b> %s",
+        c = snprintf(out, outsize, "%s %s",
                      item < DT_COLLECTION_PROP_LAST ? dt_collection_name(item) : "???", pretty);
       }
 
@@ -1541,9 +1592,13 @@ static void _history_pretty_print(const char *buf, char *out, size_t outsize)
   }
 }
 
-static void _event_history_apply(GtkWidget *widget, dt_lib_module_t *self)
+static void _event_history_apply(GSimpleAction *action,
+                                 GVariant *parameter,
+                                 gpointer user_data)
 {
-  const int hid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "history"));
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+
+  const int hid = g_variant_get_int32(parameter);
   if(hid < 0 || hid >= dt_conf_get_int("plugins/lighttable/filtering/history_max")) return;
 
   char confname[200];
@@ -1559,9 +1614,26 @@ static void _event_history_apply(GtkWidget *widget, dt_lib_module_t *self)
 
 static void _event_history_show(GtkWidget *widget, dt_lib_module_t *self)
 {
+  GActionGroup *action_group = gtk_widget_get_action_group(widget, "event_history");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "activate", _event_history_apply, "i", NULL },
+    };
+
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(widget, 
+                                   "event_history",
+                                   G_ACTION_GROUP(action_group));
+  }
+
   // we show a popup with all the history entries
-  GtkMenuShell *pop = GTK_MENU_SHELL(gtk_menu_new());
-  gtk_widget_set_size_request(GTK_WIDGET(pop), 200, -1);
+  GMenu *menu = g_menu_new();
 
   const int maxitems = dt_conf_get_int("plugins/lighttable/filtering/history_max");
 
@@ -1574,13 +1646,12 @@ static void _event_history_show(GtkWidget *widget, dt_lib_module_t *self)
     {
       char str[2048] = { 0 };
       _history_pretty_print(line, str, sizeof(str));
-      GtkWidget *smt = gtk_menu_item_new_with_label(str);
-      gtk_widget_set_tooltip_markup(smt, str);
-      GtkWidget *child = gtk_bin_get_child(GTK_BIN(smt));
-      gtk_label_set_use_markup(GTK_LABEL(child), TRUE);
-      g_object_set_data(G_OBJECT(smt), "history", GINT_TO_POINTER(i));
-      g_signal_connect(G_OBJECT(smt), "activate", G_CALLBACK(_event_history_apply), self);
-      gtk_menu_shell_append(pop, smt);
+      GMenuItem *item = g_menu_item_new(str, NULL);
+      g_menu_item_set_action_and_target_value(item,
+                                              "event_history.activate",
+                                              g_variant_new("i", i));
+      g_menu_append_item(menu, item);
+      g_object_unref(item);
       g_free(line);
     }
     else
@@ -1590,7 +1661,9 @@ static void _event_history_show(GtkWidget *widget, dt_lib_module_t *self)
     }
   }
 
-  dt_gui_menu_popup(GTK_MENU(pop), widget, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH);
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(widget, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
 static void _topbar_populate_prop_combo_add(GtkWidget *w, const dt_collection_properties_t prop,
@@ -1648,6 +1721,7 @@ static void _topbar_populate_rules_combo(GtkWidget *w, dt_lib_filtering_t *d)
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_FLASH);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_EXPOSURE_PROGRAM);
   ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_METERING_MODE);
+  ADD_COLLECT_ENTRY(DT_COLLECTION_PROP_DIMENSIONS);
   // if we have not added any entry, remove the section
   if(nb == dt_bauhaus_combobox_length(w)) dt_bauhaus_combobox_remove_at(w, nb - 1);
 
@@ -1665,10 +1739,13 @@ static void _topbar_populate_rules_combo(GtkWidget *w, dt_lib_filtering_t *d)
 #undef ADD_COLLECT_ENTRY
 }
 
-static gboolean _topbar_rule_remove(GtkWidget *widget, GdkEventButton *event, dt_lib_module_t *self)
+static void _topbar_rule_remove_cb(GtkGestureSingle *gesture, int n_press,
+                                       double x, double y,
+                                       dt_lib_module_t *self)
 {
+  GtkWidget *widget = dt_gui_get_widget(gesture);
   dt_lib_filtering_rule_t *rule = (dt_lib_filtering_rule_t *)g_object_get_data(G_OBJECT(widget), "rule");
-  if(rule->manual_widget_set) return TRUE;
+  if(rule->manual_widget_set) return;
   dt_lib_filtering_t *d = self->data;
 
   // unpin the rule
@@ -1676,19 +1753,19 @@ static gboolean _topbar_rule_remove(GtkWidget *widget, GdkEventButton *event, dt
   _topbar_update(self);
 
   // remove the rule
-  _event_rule_close(widget, NULL, self);
+  _rule_remove_config_entries(self, rule);
 
   // reconstruct the combobox
   GtkWidget *hb = gtk_widget_get_parent(widget);
-  GList *childs = gtk_container_get_children(GTK_CONTAINER(gtk_widget_get_parent(hb)));
+  GtkWidget *popover_vbox = gtk_widget_get_parent(hb);
+  GList *childs = gtk_container_get_children(GTK_CONTAINER(popover_vbox));
   GtkWidget *combo = g_list_last(childs)->data;
+  g_list_free(childs);
   dt_bauhaus_combobox_clear(combo);
   _topbar_populate_rules_combo(combo, d);
 
   // remove the entry from the popover
-  gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(hb)), hb);
-
-  return TRUE;
+  gtk_container_remove(GTK_CONTAINER(popover_vbox), hb);
 }
 
 static GtkWidget *_topbar_menu_new_rule(dt_lib_filtering_rule_t *rule, dt_lib_module_t *self)
@@ -1698,7 +1775,7 @@ static GtkWidget *_topbar_menu_new_rule(dt_lib_filtering_rule_t *rule, dt_lib_mo
   gtk_box_pack_start(GTK_BOX(hb), lb, TRUE, TRUE, 0);
   GtkWidget *btr = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
   g_object_set_data(G_OBJECT(btr), "rule", rule);
-  g_signal_connect(G_OBJECT(btr), "button-press-event", G_CALLBACK(_topbar_rule_remove), self);
+  dt_gui_connect_click_all(btr, _topbar_rule_remove_cb, NULL, self);
   gtk_box_pack_start(GTK_BOX(hb), btr, FALSE, TRUE, 0);
   return hb;
 }
@@ -1718,10 +1795,8 @@ static void _topbar_rule_add(GtkWidget *widget, dt_lib_module_t *self)
     return;
   }
 
-  // add the new rule
-  g_object_set_data(G_OBJECT(widget), "collect_id", GINT_TO_POINTER(prop));
-  g_object_set_data(G_OBJECT(widget), "topbar", GINT_TO_POINTER(1));
-  _event_append_rule(widget, self);
+  GVariant *v = g_variant_new("(ii)", prop, 1);
+  _event_append_rule(NULL, v, self);
 
   // reset the combobox
   dt_bauhaus_combobox_set(widget, 0);
@@ -1774,7 +1849,7 @@ static void _topbar_show_pref_menu(dt_lib_module_t *self, GtkWidget *bt)
   gtk_box_pack_start(GTK_BOX(vbox), lb, TRUE, TRUE, 0);
   GtkWidget *btr = gtk_button_new_with_label(_("reset quickfilters"));
   dt_gui_add_class(btr, "dt_transparent_background");
-  g_signal_connect(G_OBJECT(btr), "button-press-event", G_CALLBACK(_topbar_reset_press), self);
+  dt_gui_connect_click_all(btr, _topbar_reset_press_cb, NULL, self);
   gtk_box_pack_start(GTK_BOX(vbox), btr, TRUE, TRUE, 0);
 
   // show the popover
@@ -1891,14 +1966,17 @@ static void _proxy_reset_filter(dt_lib_module_t *self, gboolean smart_filter)
   }
 }
 
-static gboolean _sort_close(GtkWidget *widget, GdkEventButton *event, dt_lib_module_t *self)
+static void _sort_close_cb(GtkGestureSingle *gesture, int n_press,
+                              double x, double y,
+                              dt_lib_module_t *self)
 {
+  GtkWidget *widget = dt_gui_get_widget(gesture);
   _widgets_sort_t *sort = (_widgets_sort_t *)g_object_get_data(G_OBJECT(widget), "sort");
-  if(sort->lib->manual_sort_set) return TRUE;
+  if(sort->lib->manual_sort_set) return;
 
   // decrease the nb of active rules
   dt_lib_filtering_t *d = sort->lib;
-  if(d->nb_sort <= 1) return FALSE;
+  if(d->nb_sort <= 1) return;
   d->nb_sort--;
   dt_conf_set_int("plugins/lighttable/filtering/num_sort", d->nb_sort);
 
@@ -1920,8 +1998,6 @@ static gboolean _sort_close(GtkWidget *widget, GdkEventButton *event, dt_lib_mod
   _history_save(d, TRUE);
   _sort_gui_update(self);
   dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD, DT_COLLECTION_PROP_SORT, NULL);
-
-  return TRUE;
 }
 
 static gboolean _sort_init(_widgets_sort_t *sort, const dt_collection_sort_t sortid, const int sortorder,
@@ -1970,11 +2046,13 @@ static gboolean _sort_init(_widgets_sort_t *sort, const dt_collection_sort_t sor
     if(num == 0)
       dt_action_define(DT_ACTION(self), NULL, _("sort direction"), sort->direction, &dt_action_def_toggle);
 
-    sort->close = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
+    sort->close = dtgtk_button_new_full(dtgtk_cairo_paint_remove, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("remove this sort order"),
+      });
     gtk_widget_set_no_show_all(sort->close, TRUE);
     g_object_set_data(G_OBJECT(sort->close), "sort", sort);
-    gtk_widget_set_tooltip_text(sort->close, _("remove this sort order"));
-    g_signal_connect(G_OBJECT(sort->close), "button-press-event", G_CALLBACK(_sort_close), self);
+    dt_gui_connect_click_all(sort->close, _sort_close_cb, NULL, self);
     gtk_box_pack_start(GTK_BOX(sort->box), sort->close, FALSE, FALSE, 0);
   }
 
@@ -2045,11 +2123,15 @@ static void _sort_gui_update(dt_lib_module_t *self)
   DT_LEAVE_GUI_UPDATE();
 }
 
-static void _sort_append_sort(GtkWidget *widget, dt_lib_module_t *self)
+static void _sort_append_sort(GSimpleAction *action,
+                              GVariant *parameter,
+                              gpointer user_data)
 {
-  // add new rule
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_filtering_t *d = self->data;
-  const int sortid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "collect_id"));
+
+  // add new rule
+  const int sortid = g_variant_get_int32(parameter);
   char confname[200] = { 0 };
 
   if(sortid >= 0)
@@ -2075,16 +2157,33 @@ static void _sort_append_sort(GtkWidget *widget, dt_lib_module_t *self)
 
 static void _sort_show_add_popup(GtkWidget *widget, dt_lib_module_t *self)
 {
+  GActionGroup *action_group = gtk_widget_get_action_group(widget, "sort");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "activate", _sort_append_sort, "i", NULL },
+    };
+
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(widget, 
+                                   "sort",
+                                   G_ACTION_GROUP(action_group));
+  }
+
+  GMenu *menu = g_menu_new();
+
   // we show a popup with all the possible sort
-  GtkMenuShell *spop = GTK_MENU_SHELL(gtk_menu_new());
-  gtk_widget_set_size_request(GTK_WIDGET(spop), 200, -1);
-
   for(const dt_introspection_type_enum_tuple_t *list = _collection_sort_names; list->name; list++)
-    _popup_add_item(spop, Q_(list->name), list->value, FALSE, G_CALLBACK(_sort_append_sort), NULL, self, 0.0);
+    _popup_add_sort_item(menu, Q_(list->name), list->value);
 
-  dt_gui_menu_popup(GTK_MENU(spop), widget, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH);
-#undef ADD_SORT_ENTRY
-
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(widget, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
 static void _sort_history_pretty_print(const char *buf, char *out, size_t outsize)
@@ -2119,9 +2218,13 @@ static void _sort_history_pretty_print(const char *buf, char *out, size_t outsiz
   }
 }
 
-static void _sort_history_apply(GtkWidget *widget, dt_lib_module_t *self)
+static void _sort_history_apply(GSimpleAction *action,
+                                GVariant *parameter,
+                                gpointer user_data)
 {
-  const int hid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "history"));
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+
+  const int hid = g_variant_get_int32(parameter);
   if(hid < 0 || hid >= dt_conf_get_int("plugins/lighttable/filtering/sort_history_max")) return;
 
   char confname[200];
@@ -2147,9 +2250,26 @@ static void _dt_images_order_change(gpointer instance, gpointer order, gpointer 
 
 static void _sort_history_show(GtkWidget *widget, dt_lib_module_t *self)
 {
+  GActionGroup *action_group = gtk_widget_get_action_group(widget, "sort_history");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "activate", _sort_history_apply, "i", NULL },
+    };
+
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(widget, 
+                                   "sort_history",
+                                   G_ACTION_GROUP(action_group));
+  }
+
   // we show a popup with all the history entries
-  GtkMenuShell *pop = GTK_MENU_SHELL(gtk_menu_new());
-  gtk_widget_set_size_request(GTK_WIDGET(pop), 200, -1);
+  GMenu *menu = g_menu_new();
 
   const int maxitems = dt_conf_get_int("plugins/lighttable/filtering/sort_history_max");
 
@@ -2162,11 +2282,12 @@ static void _sort_history_show(GtkWidget *widget, dt_lib_module_t *self)
     {
       char str[2048] = { 0 };
       _sort_history_pretty_print(line, str, sizeof(str));
-      GtkWidget *smt = gtk_menu_item_new_with_label(str);
-      gtk_widget_set_tooltip_text(smt, str);
-      g_object_set_data(G_OBJECT(smt), "history", GINT_TO_POINTER(i));
-      g_signal_connect(G_OBJECT(smt), "activate", G_CALLBACK(_sort_history_apply), self);
-      gtk_menu_shell_append(pop, smt);
+      GMenuItem *item = g_menu_item_new(str, NULL);
+      g_menu_item_set_action_and_target_value(item,
+                                              "sort_history.activate",
+                                              g_variant_new("i", i));
+      g_menu_append_item(menu, item);
+      g_object_unref(item);
       g_free(line);
     }
     else
@@ -2176,7 +2297,9 @@ static void _sort_history_show(GtkWidget *widget, dt_lib_module_t *self)
     }
   }
 
-  dt_gui_menu_popup(GTK_MENU(pop), widget, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH);
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(widget, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
 void gui_init(dt_lib_module_t *self)

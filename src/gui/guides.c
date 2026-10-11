@@ -16,12 +16,15 @@
  *    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <glib-2.0/gio/gio.h>
 #include <glib.h>
 
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
 #include "common/math.h"
+#include "control/conf.h"
 #include "dtgtk/button.h"
+#include "gui/gtk.h"
 #include "gui/guides.h"
 
 #define DEFAULT_GUIDE_NAME "rules of thirds"
@@ -963,30 +966,36 @@ void dt_guides_draw(cairo_t *cr,
   cairo_restore(cr);
 }
 
-static void _settings_autoshow_change(GtkWidget *mi,
-                                      dt_iop_module_t *module)
+static void _settings_autoshow_change(GSimpleAction *action,
+                                      GVariant *parameter,
+                                      gpointer user_data)
 {
+  dt_iop_module_t *module = (dt_iop_module_t *)user_data;
+
   // we inverse the autoshow value for the module
   gchar *key = _conf_get_path(module->op, "autoshow", NULL);
   dt_conf_set_bool(key, !dt_conf_get_bool(key));
   DT_ENTER_GUI_UPDATE();
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(module->guides_combo),
-                               dt_conf_get_bool(key));
+  dt_bauhaus_toggle_set(module->guides_combo, dt_conf_get_bool(key));
+  gtk_popover_popdown(GTK_POPOVER(darktable.gui->active_popover_menu));
   DT_LEAVE_GUI_UPDATE();
   g_free(key);
   dt_control_queue_redraw_center();
 }
 
-void dt_guides_add_module_menuitem(void *menu,
+void dt_guides_add_module_menuitem(GMenu *menu,
+                                   GActionGroup *action_group,
                                    dt_iop_module_t *module)
 {
-  GtkWidget *mi = gtk_check_menu_item_new_with_label(_("show guides"));
   gchar *key = _conf_get_path(module->op, "autoshow", NULL);
-  gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi), dt_conf_get_bool(key));
+  GVariant *initial_state = g_variant_new_boolean(dt_conf_get_bool(key));
   g_free(key);
-  g_signal_connect(G_OBJECT(mi), "activate",
-                   G_CALLBACK(_settings_autoshow_change), module);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+
+  GSimpleAction *action = g_simple_action_new_stateful("guides", NULL, initial_state);
+  g_signal_connect(action, "activate", G_CALLBACK(_settings_autoshow_change), module);
+
+  g_action_map_add_action(G_ACTION_MAP(action_group), G_ACTION(action)); 
+  g_menu_append(menu, _("show guides"), "presets.guides");
 }
 
 static void free_guide(void *data)
@@ -1006,7 +1015,7 @@ static void _settings_autoshow_change2(GtkWidget *combo,
 {
   DT_GUARD_GUI_UPDATE();
   gchar *key = _conf_get_path(module->op, "autoshow", NULL);
-  dt_conf_set_bool(key, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(combo)));
+  dt_conf_set_bool(key, dt_bauhaus_toggle_get(combo));
   g_free(key);
   dt_control_queue_redraw_center();
 }
@@ -1016,6 +1025,12 @@ static void _settings_autoshow_menu(GtkWidget *button,
 {
   GtkWidget *popover = darktable.view_manager->guides_popover;
   gtk_popover_set_relative_to(GTK_POPOVER(popover), button);
+
+  // the icon is this widget's quad, so point at that rather than letting the
+  // popup aim at the middle of the whole checkbox
+  GdkRectangle quad;
+  dt_bauhaus_widget_get_quad_rect(button, &quad);
+  gtk_popover_set_pointing_to(GTK_POPOVER(popover), &quad);
 
   g_object_set(G_OBJECT(popover), "transitions-enabled", FALSE, NULL);
 
@@ -1029,38 +1044,48 @@ void dt_guides_init_module_widget(GtkWidget *iopw,
 {
   if(!(module->flags() & IOP_FLAGS_GUIDES_WIDGET)) return;
 
-  GtkWidget *cb = module->guides_combo = gtk_check_button_new_with_label(_("show guides"));
-  gtk_label_set_ellipsize(GTK_LABEL(gtk_bin_get_child(GTK_BIN(cb))), PANGO_ELLIPSIZE_START);
+  // no field: whether the overlay is shown is a per module preference kept
+  // in conf, not one of the module's parameters
+  GtkWidget *cb = module->guides_combo = dt_bauhaus_toggle_new(module);
+  dt_bauhaus_widget_set_label(cb, NULL, N_("show guides"));
+  // this row is the only checkbox that carries an icon of its own, and it is
+  // added to the bottom of modules whose other widgets it knows nothing
+  // about, so give it a class of its own to be spaced by rather than
+  // borrowing the one every checkbox in every module is drawn with
+  dt_gui_add_class(cb, "dt_guides_toggle");
+  dt_bauhaus_widget_set_label_ellipsize(cb, PANGO_ELLIPSIZE_START);
 
   gchar *key = _conf_get_path(module->op, "autoshow", NULL);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(cb), dt_conf_get_bool(key));
+  dt_bauhaus_toggle_set(cb, dt_conf_get_bool(key));
   g_free(key);
 
-  g_signal_connect(G_OBJECT(cb), "toggled",
+  g_signal_connect(G_OBJECT(cb), "value-changed",
                    G_CALLBACK(_settings_autoshow_change2), module);
   gtk_widget_set_tooltip_text(cb, _("show guide overlay when this module has focus"));
-  GtkWidget *ic = dtgtk_button_new(dtgtk_cairo_paint_grid, 0, NULL);
-  gtk_widget_set_tooltip_text
-    (ic, _("change global guide settings\nnote that these settings are applied globally "
-           "and will impact any module that shows guide overlays"));
-  g_signal_connect(G_OBJECT(ic), "clicked",
-                   G_CALLBACK(_settings_autoshow_menu), module);
 
-  GtkWidget *box = dt_gui_hbox(dt_gui_expand(cb), ic);
+  // the settings icon goes in the widget's own quad, which is the column the
+  // sliders and comboboxes above draw theirs in, rather than in a box beside
+  // the widget where it would sit further out than all of them
+  dt_bauhaus_widget_set_quad
+    (cb, module, dtgtk_cairo_paint_grid, FALSE, _settings_autoshow_menu,
+     _("change global guide settings\nnote that these settings are applied globally "
+       "and will impact any module that shows guide overlays"));
+
   // we hide it if the preference is set to "off"
-  gtk_widget_set_no_show_all(box, TRUE);
+  gtk_widget_set_no_show_all(cb, TRUE);
   gtk_widget_show(cb);
-  gtk_widget_show(ic);
 
-  dt_gui_box_add(iopw, box);
+  dt_gui_box_add(iopw, cb);
 }
 
 void dt_guides_update_module_widget(const dt_iop_module_t *module)
 {
   if(!module->guides_combo) return;
 
-  GtkWidget *box = gtk_widget_get_parent(module->guides_combo);
-  gtk_widget_set_visible(box, dt_conf_get_bool("plugins/darkroom/show_guides_in_ui"));
+  // the checkbox is added to the module box directly, there is no wrapper
+  // to hide any more
+  gtk_widget_set_visible(module->guides_combo,
+                         dt_conf_get_bool("plugins/darkroom/show_guides_in_ui"));
 }
 
 void dt_guides_update_popover_values()

@@ -104,7 +104,7 @@ typedef struct dt_iop_colorharmonizer_gui_data_t
   dt_gui_collapsible_section_t sat_section;              // collapsible "Saturation" section
   float      hue_histogram[COLORHARMONIZER_HUE_BINS];
   gboolean   histogram_valid;
-  GMutex     histogram_lock;
+  gboolean   auto_detect_pending;
 } dt_iop_colorharmonizer_gui_data_t;
 
 typedef struct dt_iop_colorharmonizer_global_data_t
@@ -118,6 +118,7 @@ static float _ucs_to_ryb_fast(const float ucs);
 static float _ryb_to_ucs_fast(const float yrb);
 static void _sync_custom_sliders(const dt_iop_colorharmonizer_params_t *p,
                                  dt_iop_colorharmonizer_gui_data_t *g);
+static void _set_auto_detect_button_state(dt_iop_module_t *self, const gboolean sensitive);
 static gboolean _auto_detect_button_enable_idle(gpointer user_data);
 
 const char *name()
@@ -294,16 +295,16 @@ static void _update_histogram(dt_iop_module_t *self,
     }
   }
 
+  dt_iop_gui_enter_critical_section(self);
   const gboolean was_invalid = !g->histogram_valid;
-  g_mutex_lock(&g->histogram_lock);
   memcpy(g->hue_histogram, local_histo, sizeof(local_histo));
   g->histogram_valid = TRUE;
-  g_mutex_unlock(&g->histogram_lock);
+  const gboolean pending = g->auto_detect_pending;
+  dt_iop_gui_leave_critical_section(self);
 
-  if(was_invalid)
+  if(was_invalid || pending)
   {
-    g_object_ref(g->auto_detect);
-    gdk_threads_add_idle(_auto_detect_button_enable_idle, g->auto_detect);
+    g_idle_add(_auto_detect_button_enable_idle, self);
   }
 }
 
@@ -822,8 +823,9 @@ static void _push_to_vectorscope(dt_iop_module_t *self)
     // Custom: provide absolute-angle nodes; type is left as NONE so the
     // vectorscope's own UI shows no standard rule selected.
     guide.type     = DT_COLOR_HARMONY_NONE;
-    guide.custom_n = p->num_custom_nodes;
-    for(int i = 0; i < p->num_custom_nodes; i++)
+    // the stored count indexes custom_hue[] and the guide's custom_angles[]
+    guide.custom_n = CLAMP(p->num_custom_nodes, 0, COLORHARMONIZER_MAX_NODES);
+    for(int i = 0; i < guide.custom_n; i++)
       guide.custom_angles[i] = _ucs_to_ryb_fast(p->custom_hue[i]);
   }
   else
@@ -909,10 +911,10 @@ static void _on_vectorscope_harmony_changed(const dt_color_harmony_guide_t *guid
   _apply_harmony_guide(self, self->params, self->gui_data, guide);
 }
 
-static void _sync_to_vectorscope_toggled(GtkToggleButton *button, dt_iop_module_t *self)
+static void _sync_to_vectorscope_toggled(GtkWidget *button, dt_iop_module_t *self)
 {
   dt_iop_colorharmonizer_gui_data_t *g = self->gui_data;
-  const gboolean active = gtk_toggle_button_get_active(button);
+  const gboolean active = dt_bauhaus_toggle_get(button);
   dt_conf_set_bool("plugins/darkroom/colorharmonizer/sync_to_vectorscope", active);
 
   if(active)
@@ -999,7 +1001,7 @@ static void _custom_hue_changed(GtkWidget *widget, dt_iop_module_t *self)
   dt_dev_add_history_item(self->dev, self, TRUE);
 
   if(g->sync_to_vectorscope
-     && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g->sync_to_vectorscope)))
+     && dt_bauhaus_toggle_get(g->sync_to_vectorscope))
     _push_to_vectorscope(self);
 }
 
@@ -1094,7 +1096,7 @@ static void _sync_vectorscope_if_enabled(dt_iop_module_t *self,
                                          GtkWidget *widget)
 {
   if(!g->sync_to_vectorscope
-     || !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g->sync_to_vectorscope)))
+     || !dt_bauhaus_toggle_get(g->sync_to_vectorscope))
     return;
 
   if(self->enabled)
@@ -1164,6 +1166,12 @@ void gui_update(dt_iop_module_t *self)
   dt_gui_update_collapsible_section(&g->sat_section);
   gui_changed(self, NULL, NULL);
   dt_iop_color_picker_reset(self, TRUE);
+
+  dt_iop_gui_enter_critical_section(self);
+  const gboolean pending = g->auto_detect_pending;
+  dt_iop_gui_leave_critical_section(self);
+
+  _set_auto_detect_button_state(self, !pending);
 }
 
 // Convert a picked pixel color (pipeline RGB) to a normalized darktable UCS hue [0, 1).
@@ -1329,33 +1337,10 @@ static void _auto_detect_harmony(const float *histo,
   }
 }
 
-static gboolean _auto_detect_button_enable_idle(gpointer user_data)
-{
-  GtkWidget *btn = GTK_WIDGET(user_data);
-  gtk_widget_set_sensitive(btn, TRUE);
-  gtk_widget_set_tooltip_text(btn,
-    _("analyze the image's hue distribution and automatically suggest the harmony rule\n"
-      "and anchor hue that best match its existing color palette.\n"
-      "\n"
-      "the detection scores every rule and anchor combination against a chroma-weighted\n"
-      "histogram of the preview image, then selects the combination that already covers\n"
-      "the most chromatic energy — i.e. requires the least correction.\n"
-      "\n"
-      "the result replaces the current rule and anchor hue. use pull strength to control\n"
-      "how strongly the remaining off-palette colors are pulled toward the detected palette."));
-  g_object_unref(btn);
-  return G_SOURCE_REMOVE;
-}
-
-static void _auto_detect_callback(GtkButton *button, dt_iop_module_t *self)
+static void _apply_auto_detect_harmony(dt_iop_module_t *self, const float *histo)
 {
   dt_iop_colorharmonizer_gui_data_t *g = self->gui_data;
   dt_iop_colorharmonizer_params_t   *p = self->params;
-
-  float histo[COLORHARMONIZER_HUE_BINS];
-  g_mutex_lock(&g->histogram_lock);
-  memcpy(histo, g->hue_histogram, sizeof(histo));
-  g_mutex_unlock(&g->histogram_lock);
 
   dt_iop_colorharmonizer_rule_t best_rule;
   float best_anchor;
@@ -1373,8 +1358,93 @@ static void _auto_detect_callback(GtkButton *button, dt_iop_module_t *self)
   dt_dev_add_history_item(self->dev, self, TRUE);
 
   if(g->sync_to_vectorscope
-     && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g->sync_to_vectorscope)))
+     && dt_bauhaus_toggle_get(g->sync_to_vectorscope))
     _push_to_vectorscope(self);
+}
+
+static void _set_auto_detect_button_state(dt_iop_module_t *self, const gboolean sensitive)
+{
+  dt_iop_colorharmonizer_gui_data_t *g = self->gui_data;
+  if(!g || !g->auto_detect) return;
+  gtk_widget_set_sensitive(g->auto_detect, sensitive);
+  if(sensitive)
+  {
+    gtk_widget_set_tooltip_text(g->auto_detect,
+      _("analyze the image's hue distribution and automatically suggest the harmony rule\n"
+        "and anchor hue that best match its existing color palette.\n"
+        "\n"
+        "the detection scores every rule and anchor combination against a chroma-weighted\n"
+        "histogram of the preview image, then selects the combination that already covers\n"
+        "the most chromatic energy — i.e. requires the least correction.\n"
+        "\n"
+        "the result replaces the current rule and anchor hue. use pull strength to control\n"
+        "how strongly the remaining off-palette colors are pulled toward the detected palette."));
+  }
+  else
+  {
+    gtk_widget_set_tooltip_text(g->auto_detect,
+      _("analyzing the image's hue distribution..."));
+  }
+}
+
+static gboolean _auto_detect_button_enable_idle(gpointer user_data)
+{
+  dt_iop_module_t *self = user_data;
+  dt_iop_colorharmonizer_gui_data_t *g = self->gui_data;
+  if(!g) return G_SOURCE_REMOVE;
+
+  float histo[COLORHARMONIZER_HUE_BINS];
+  gboolean run_detection = FALSE;
+
+  dt_iop_gui_enter_critical_section(self);
+  if(g->auto_detect_pending && g->histogram_valid)
+  {
+    g->auto_detect_pending = FALSE;
+    memcpy(histo, g->hue_histogram, sizeof(histo));
+    run_detection = TRUE;
+  }
+  dt_iop_gui_leave_critical_section(self);
+
+  if(run_detection)
+  {
+    _apply_auto_detect_harmony(self, histo);
+  }
+
+  _set_auto_detect_button_state(self, TRUE);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void _auto_detect_callback(GtkButton *button, dt_iop_module_t *self)
+{
+  dt_iop_colorharmonizer_gui_data_t *g = self->gui_data;
+  if(!g) return;
+
+  float histo[COLORHARMONIZER_HUE_BINS];
+  gboolean valid = FALSE;
+
+  dt_iop_gui_enter_critical_section(self);
+  if(g->auto_detect_pending)
+  {
+    dt_iop_gui_leave_critical_section(self);
+    return;
+  }
+  valid = g->histogram_valid;
+  if(valid)
+    memcpy(histo, g->hue_histogram, sizeof(histo));
+  else
+    g->auto_detect_pending = TRUE;
+  dt_iop_gui_leave_critical_section(self);
+
+  if(valid)
+  {
+    _apply_auto_detect_harmony(self, histo);
+  }
+  else
+  {
+    _set_auto_detect_button_state(self, FALSE);
+    dt_dev_add_history_item(self->dev, self, TRUE);
+  }
 }
 
 static void _set_from_vectorscope_callback(GtkButton *button, dt_iop_module_t *self)
@@ -1412,11 +1482,12 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_hexpand(g->rule, TRUE);
   self->widget = main_box;
 
-  g->auto_detect = dtgtk_button_new(dtgtk_cairo_paint_camera, CPF_NONE, NULL);
-  gtk_widget_set_sensitive(g->auto_detect, FALSE);
-  gtk_widget_set_tooltip_text(g->auto_detect,
-    _("not yet available — wait for the preview to finish processing."));
-  g_signal_connect(G_OBJECT(g->auto_detect), "clicked", G_CALLBACK(_auto_detect_callback), self);
+  g->auto_detect = dtgtk_button_new_full(dtgtk_cairo_paint_camera, CPF_NONE, NULL,
+      &(dtgtk_button_config_t){
+        .clicked_cb = G_CALLBACK(_auto_detect_callback),
+        .clicked_data = self,
+      });
+  _set_auto_detect_button_state(self, TRUE);
   dt_gui_box_add(rule_row, g->auto_detect);
 
   gtk_widget_set_tooltip_text(g->rule,
@@ -1510,9 +1581,11 @@ void gui_init(dt_iop_module_t *self)
 
   GtkWidget *sync_row = dt_gui_hbox();
 
-  g->sync_to_vectorscope = gtk_check_button_new_with_label(_("vectorscope two-way sync"));
-  gtk_label_set_ellipsize(GTK_LABEL(gtk_bin_get_child(GTK_BIN(g->sync_to_vectorscope))),
-                          PANGO_ELLIPSIZE_END);
+  // no field: this only says whether the vectorscope overlay follows the
+  // module, it is not one of the module's parameters
+  g->sync_to_vectorscope = dt_bauhaus_toggle_new(self);
+  dt_bauhaus_widget_set_label(g->sync_to_vectorscope, NULL,
+                              N_("vectorscope two-way sync"));
   gtk_widget_set_tooltip_text(g->sync_to_vectorscope,
     _("when enabled, the vectorscope harmony overlay is kept in sync with\n"
       "the harmony rule and anchor hue controls in the module.\n"
@@ -1521,17 +1594,18 @@ void gui_init(dt_iop_module_t *self)
   const char *conf_key = "plugins/darkroom/colorharmonizer/sync_to_vectorscope";
   if(!dt_conf_key_exists(conf_key))
     dt_conf_set_bool(conf_key, TRUE);
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->sync_to_vectorscope), dt_conf_get_bool(conf_key));
+  dt_bauhaus_toggle_set(g->sync_to_vectorscope, dt_conf_get_bool(conf_key));
 
-  g_signal_connect(G_OBJECT(g->sync_to_vectorscope), "toggled",
+  g_signal_connect(G_OBJECT(g->sync_to_vectorscope), "value-changed",
                    G_CALLBACK(_sync_to_vectorscope_toggled), self);
 
-  g->set_from_vectorscope = dtgtk_button_new(dtgtk_cairo_paint_refresh, CPF_NONE, NULL);
-  gtk_widget_set_tooltip_text(g->set_from_vectorscope,
-    _("import the harmony rule and anchor hue currently displayed in the vectorscope.\n"
-      "also switches the histogram panel to the vectorscope view if it is not already active."));
-  g_signal_connect(G_OBJECT(g->set_from_vectorscope), "clicked",
-                   G_CALLBACK(_set_from_vectorscope_callback), self);
+  g->set_from_vectorscope = dtgtk_button_new_full(dtgtk_cairo_paint_refresh, CPF_NONE, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("import the harmony rule and anchor hue currently displayed in the vectorscope.\n"
+          "also switches the histogram panel to the vectorscope view if it is not already active."),
+        .clicked_cb = G_CALLBACK(_set_from_vectorscope_callback),
+        .clicked_data = self,
+      });
 
   gtk_widget_set_hexpand(g->sync_to_vectorscope, TRUE);
   dt_gui_box_add(sync_row, g->sync_to_vectorscope);
@@ -1542,10 +1616,10 @@ void gui_init(dt_iop_module_t *self)
   // "set from vectorscope" is redundant when sync is active; disable it initially
   // (sync checkbox starts checked, so the button starts insensitive)
   gtk_widget_set_sensitive(g->set_from_vectorscope,
-      !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g->sync_to_vectorscope)));
+      !dt_bauhaus_toggle_get(g->sync_to_vectorscope));
 
   g->histogram_valid = FALSE;
-  g_mutex_init(&g->histogram_lock);
+  g->auto_detect_pending = FALSE;
 
   g->pull_strength = dt_bauhaus_slider_from_params(self, "pull_strength");
   gtk_widget_set_tooltip_text(g->pull_strength,
@@ -1636,7 +1710,7 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
   dt_iop_colorharmonizer_gui_data_t *g = self->gui_data;
   if(!g) return;
   const gboolean sync = g->sync_to_vectorscope
-      && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(g->sync_to_vectorscope));
+      && dt_bauhaus_toggle_get(g->sync_to_vectorscope);
   if(in)
   {
     if(sync && self->enabled)
@@ -1655,13 +1729,32 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
   }
 }
 
-void gui_cleanup(dt_iop_module_t *self)
+void change_image(dt_iop_module_t *self)
 {
   dt_iop_colorharmonizer_gui_data_t *g = self->gui_data;
   if(g)
   {
+    while(g_idle_remove_by_data(self)) ;
+
+    dt_iop_gui_enter_critical_section(self);
+    g->histogram_valid = FALSE;
+    g->auto_detect_pending = FALSE;
+    dt_iop_gui_leave_critical_section(self);
+
+    _set_auto_detect_button_state(self, TRUE);
+  }
+}
+
+void gui_cleanup(dt_iop_module_t *self)
+{
+  while(g_idle_remove_by_data(self)) ;
+  dt_iop_colorharmonizer_gui_data_t *g = self->gui_data;
+  if(g)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    g->auto_detect_pending = FALSE;
+    dt_iop_gui_leave_critical_section(self);
     dt_lib_histogram_set_harmony_callback(darktable.lib, NULL, NULL);
-    g_mutex_clear(&g->histogram_lock);
   }
   dt_iop_default_cleanup(self);
 }

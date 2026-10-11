@@ -2135,27 +2135,18 @@ static int _brush_events_button_released(dt_iop_module_t *module,
   }
   else if(gui->form_dragging)
   {
-    // we end the form dragging
+    // the move was already applied incrementally, tick by tick, in
+    // mouse_moved (each tick recomputes its own delta from the *current*
+    // corner, so the shape is already at the correct final position by the
+    // time the button comes up) -- just finalise. Do NOT recompute pts from
+    // this release event's own pzx/pzy and re-apply a second, independent
+    // delta here: that used the constant press-time anchor (gui->dx/dy)
+    // against whatever position this one event happens to carry, so any
+    // discrepancy between it and the last mouse_moved tick's position -- a
+    // slightly stale/short release event is enough -- silently re-moved the
+    // already-correctly-placed shape a second time (observed live as the
+    // shape snapping to a wrong position right on mouse-up).
     gui->form_dragging = FALSE;
-
-    // we get point0 new values
-    dt_masks_point_brush_t *point = (form->points)->data;
-    float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-    float dx = pts[0] / iwidth - point->corner[0];
-    float dy = pts[1] / iheight - point->corner[1];
-
-    // we move all points
-    for(GList *points = form->points; points; points = g_list_next(points))
-    {
-      point = (dt_masks_point_brush_t *)points->data;
-      point->corner[0] += dx;
-      point->corner[1] += dy;
-      point->ctrl1[0] += dx;
-      point->ctrl1[1] += dy;
-      point->ctrl2[0] += dx;
-      point->ctrl2[1] += dy;
-    }
 
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
@@ -2166,14 +2157,13 @@ static int _brush_events_button_released(dt_iop_module_t *module,
   }
   else if(gui->source_dragging)
   {
-    // we end the form dragging
+    // same reasoning as gui->form_dragging above: mouse_moved already set
+    // form->source fresh on every tick, so recomputing it again here from
+    // this release event's own pzx/pzy is redundant and risks re-moving the
+    // already-correctly-placed source a second time if this event's
+    // position ever diverges from the last tick's.
     gui->source_dragging = FALSE;
 
-    // we change the source value
-    float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-    form->source[0] = pts[0] / iwidth;
-    form->source[1] = pts[1] / iheight;
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
     // we recreate the form points
@@ -2189,8 +2179,15 @@ static int _brush_events_button_released(dt_iop_module_t *module,
   }
   else if(gui->point_dragging >= 0)
   {
-    dt_masks_point_brush_t *point
-        = (dt_masks_point_brush_t *)g_list_nth_data(form->points, gui->point_dragging);
+    // same reasoning as gui->form_dragging/source_dragging above, just at
+    // node granularity: mouse_moved already set point->corner/ctrl1/ctrl2 to
+    // their fresh absolute position on every tick, so recomputing pts from
+    // this release event's own pzx/pzy and re-applying another delta here is
+    // redundant -- and if this event's position ever diverges from the last
+    // tick's (e.g. a spurious/stale release carrying a leftover (0,0)), it
+    // silently re-moves the already-correctly-placed node a second time,
+    // observed live as the node snapping to the image's top-left corner
+    // right on mouse-up.
     gui->point_dragging = -1;
     if(gui->scrollx != 0.0f || gui->scrolly != 0.0f)
     {
@@ -2198,19 +2195,6 @@ static int _brush_events_button_released(dt_iop_module_t *module,
       return 1;
     }
     gui->scrollx = gui->scrolly = 0;
-    float pts[2] = { pzx * wd, pzy * ht };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-    float dx = pts[0] / iwidth - point->corner[0];
-    float dy = pts[1] / iheight - point->corner[1];
-
-    point->corner[0] += dx;
-    point->corner[1] += dy;
-    point->ctrl1[0] += dx;
-    point->ctrl1[1] += dy;
-    point->ctrl2[0] += dx;
-    point->ctrl2[1] += dy;
-
-    _brush_init_ctrl_points(form);
 
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
@@ -2224,18 +2208,6 @@ static int _brush_events_button_released(dt_iop_module_t *module,
     dt_masks_point_brush_t *point
         = (dt_masks_point_brush_t *)g_list_nth_data(form->points, gui->feather_dragging);
     gui->feather_dragging = -1;
-    float pts[2] = { pzx * wd, pzy * ht };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-
-    float p1x, p1y, p2x, p2y;
-    _brush_feather_to_ctrl(point->corner[0] * iwidth,
-                           point->corner[1] * iheight,
-                           pts[0], pts[1],
-                           &p1x, &p1y, &p2x, &p2y, TRUE);
-    point->ctrl1[0] = p1x / iwidth;
-    point->ctrl1[1] = p1y / iheight;
-    point->ctrl2[0] = p2x / iwidth;
-    point->ctrl2[1] = p2y / iheight;
 
     point->state = DT_MASKS_POINT_STATE_USER;
 
@@ -2546,6 +2518,7 @@ static int _brush_events_mouse_moved(struct dt_iop_module_t *module,
   else if(gui->form_dragging || gui->source_dragging)
   {
     float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
+    dt_masks_clamp_move_pts(pts, wd, ht);
     dt_dev_distort_backtransform(darktable.develop, pts, 1);
 
     // we move all points
@@ -2611,7 +2584,6 @@ static int _brush_events_mouse_moved(struct dt_iop_module_t *module,
          && pzy - ffy < as)
       {
         gui->feather_selected = k;
-        dt_control_queue_redraw_center();
         return 1;
       }
     }
@@ -2622,7 +2594,6 @@ static int _brush_events_mouse_moved(struct dt_iop_module_t *module,
        && pzy - gpt->points[k * 6 + 3] < as)
     {
       gui->point_selected = k;
-      dt_control_queue_redraw_center();
       return 1;
     }
   }
@@ -2636,7 +2607,6 @@ static int _brush_events_mouse_moved(struct dt_iop_module_t *module,
        && pzy - gpt->points[k * 6 + 3] < as)
     {
       gui->point_selected = k;
-      dt_control_queue_redraw_center();
       return 1;
     }
 
@@ -2647,7 +2617,6 @@ static int _brush_events_mouse_moved(struct dt_iop_module_t *module,
        && pzy - gpt->border[k * 6 + 1] < as)
     {
       gui->point_border_selected = k;
-      dt_control_queue_redraw_center();
       return 1;
     }
   }
@@ -2678,7 +2647,6 @@ static int _brush_events_mouse_moved(struct dt_iop_module_t *module,
     }
   }
 
-  dt_control_queue_redraw_center();
   if(!gui->form_selected && !gui->border_selected && gui->seg_selected < 0) return 0;
   if(gui->edit_mode != DT_MASKS_EDIT_FULL) return 0;
   return 1;
@@ -2877,30 +2845,26 @@ static void _brush_events_post_expose(cairo_t *cr,
   // draw path
   if(gpt->points_count > _nb_ctrl_point(nb) + 2)
   {
-    cairo_move_to(cr, gpt->points[nb * 6], gpt->points[nb * 6 + 1]);
-
     int seg = 1;
-    int i = _nb_ctrl_point(nb);
+    int start = _nb_ctrl_point(nb);
 
-    while(seg)
+    // we decide to highlight the form segment by segment
+    for(int i = start; seg; i++)
     {
-      cairo_line_to(cr, gpt->points[i * 2], gpt->points[i * 2 + 1]);
-      // we decide to highlight the form segment by segment
       if(gpt->points[i * 2 + 1] == gpt->points[seg * 6 + 3]
          && gpt->points[i * 2] == gpt->points[seg * 6 + 2])
       {
         // this is the end of the last segment, so we have to draw it
-        dt_masks_line_stroke
-          (cr, FALSE, FALSE,
+        dt_masks_stroke_polyline
+          (cr, gpt->points, start, i, FALSE, FALSE, FALSE,
            (gui->group_selected == index)
            && (gui->form_selected || gui->form_dragging || gui->seg_selected == seg - 1),
            zoom_scale);
 
         // and we update the segment number
         seg = (seg + 1) % nb;
-        cairo_move_to(cr, gpt->points[i * 2], gpt->points[i * 2 + 1]);
+        start = i;
       }
-      i++;
     }
   }
 
@@ -2948,15 +2912,8 @@ static void _brush_events_post_expose(cairo_t *cr,
       || gui->group_selected == index)
      && gpt->border_count > _nb_ctrl_point(nb) + 2)
   {
-    cairo_move_to(cr, gpt->border[nb * 6], gpt->border[nb * 6 + 1]);
-
-    for(int i = _nb_ctrl_point(nb) + 1; i < gpt->border_count; i++)
-    {
-      cairo_line_to(cr, gpt->border[i * 2], gpt->border[i * 2 + 1]);
-    }
-    // we execute the drawing
-
-    dt_masks_line_stroke(cr, TRUE, FALSE, gui->border_selected, zoom_scale);
+    dt_masks_stroke_polyline(cr, gpt->border, _nb_ctrl_point(nb), gpt->border_count - 1,
+                           FALSE, TRUE, FALSE, gui->border_selected, zoom_scale);
   }
 
   // draw the source if needed
@@ -3006,13 +2963,8 @@ static void _brush_events_post_expose(cairo_t *cr,
 
     // we draw the source
 
-    cairo_move_to(cr, gpt->source[nb * 6], gpt->source[nb * 6 + 1]);
-    for(int i = _nb_ctrl_point(nb); i < gpt->source_count; i++)
-      cairo_line_to(cr, gpt->source[i * 2], gpt->source[i * 2 + 1]);
-    cairo_line_to(cr, gpt->source[nb * 6], gpt->source[nb * 6 + 1]);
-
-    dt_masks_line_stroke
-      (cr, FALSE, TRUE,
+    dt_masks_stroke_polyline
+      (cr, gpt->source, _nb_ctrl_point(nb), gpt->source_count - 1, TRUE, FALSE, TRUE,
        (gui->group_selected == index) && (gui->form_selected || gui->form_dragging),
        zoom_scale);
   }

@@ -95,11 +95,18 @@ fprintf(stderr, "darktable %s\n"
                 "                          multiple times instead of input file\n"
                 "   --library <path> read the history stack from library database\n"
                 "                    instead of XMP sidecar files\n"
+                "                    using ':memory:' for an empty in-memory library\n"
+                "                    is useless for darktable cli export\n"
                 "   --icc-type <type> specify icc type, default to NONE\n"
                 "                     use --help icc-type for list of supported types\n"
                 "   --icc-file <file> specify icc filename, default to NONE\n"
                 "   --icc-intent <intent> specify icc intent, default to LAST\n"
                 "                     use --help icc-intent for list of supported intents\n"
+                "   --print-paths     print the resolved configdir, cachedir, tmpdir,\n"
+                "                     datadir, moduledir, localedir and library paths\n"
+                "                     for this install, then exit\n"
+                "   --print-paths-as-flags  like --print-paths, printed as a single\n"
+                "                     line of --flag value pairs\n"
                 "   --verbose\n"
                 "   -h, --help [option]\n"
                 "   -v, --version\n",
@@ -236,6 +243,7 @@ int main(int argc, char *arg[])
   gboolean verbose = FALSE, high_quality = TRUE, upscale = FALSE,
            style_overwrite = FALSE, custom_presets = TRUE, export_masks = FALSE,
            output_to_dir = FALSE;
+  gboolean print_paths = FALSE, print_paths_as_flags = FALSE;
 
   GList* inputs = NULL;
 
@@ -384,6 +392,13 @@ int main(int argc, char *arg[])
       {
         k++;
         library = arg[k];
+        if(!strcmp(library, ":memory:"))
+        {
+          fprintf(stderr, _("empty in-memory library is useless for darktable cli export\n"));
+          usage(arg[0]);
+          exit(1);
+        }
+
       }
       else if(!strcmp(arg[k], "--icc-type") && argc > k + 1)
       {
@@ -433,6 +448,16 @@ int main(int argc, char *arg[])
         k++;
         break;
       }
+      else if(!strcmp(arg[k], "--print-paths"))
+      {
+        print_paths = TRUE;
+        print_paths_as_flags = FALSE;
+      }
+      else if(!strcmp(arg[k], "--print-paths-as-flags"))
+      {
+        print_paths_as_flags = TRUE;
+        print_paths = FALSE;
+      }
       else
       {
         fprintf(stderr, _("warning: unknown option '%s'\n"), arg[k]);
@@ -453,14 +478,26 @@ int main(int argc, char *arg[])
   }
 
   int m_argc = 0;
-  char **m_arg = malloc(sizeof(char *) * (5 + argc - k + 1));
+  char **m_arg = malloc(sizeof(char *) * (6 + argc - k + 1));
   m_arg[m_argc++] = "darktable-cli";
   m_arg[m_argc++] = "--library";
   m_arg[m_argc++] = library ? library : ":memory:";
   m_arg[m_argc++] = "--conf";
   m_arg[m_argc++] = "write_sidecar_files=never";
   for(; k < argc; k++) m_arg[m_argc++] = arg[k];
+  if(print_paths_as_flags)
+    m_arg[m_argc++] = "--print-paths-as-flags";
+  else if(print_paths)
+    m_arg[m_argc++] = "--print-paths";
   m_arg[m_argc] = NULL;
+
+  if(print_paths || print_paths_as_flags)
+  {
+    // dt_init() resolves and prints the paths, then exit()s directly -
+    // skip the input/output file requirements below, they don't apply
+    // to a paths query.
+    dt_init(m_argc, m_arg, FALSE, custom_presets, NULL);
+  }
 
   gboolean args_error = FALSE;
   if(inputs && file_counter < 1)
@@ -574,6 +611,9 @@ int main(int argc, char *arg[])
       g_list_free_full(inputs, g_free);
     exit(1);
   }
+
+  // When --library was provided, use the DB history; otherwise keep XMP override mode.
+  darktable.prefer_library_history = (library != NULL);
 
   GList *id_list = NULL;
 

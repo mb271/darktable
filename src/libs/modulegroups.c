@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+
 #include "common/gdk_event_utils.h"
 
 #include "bauhaus/bauhaus.h"
@@ -33,6 +34,12 @@
 #include "gui/presets.h"
 #include "libs/lib.h"
 #include "libs/lib_api.h"
+#include <glib-2.0/gio/gio.h>
+#include <glib-2.0/gio/gmenu.h>
+#include <glib-2.0/gio/gmenumodel.h>
+#include <glib-2.0/glib-object.h>
+#include <glib-2.0/glib.h>
+
 #ifdef GDK_WINDOWING_QUARTZ
 #include "osx/osx.h"
 #endif
@@ -52,7 +59,7 @@ DT_MODULE(1)
 // list of recommended basics widgets
 #define RECOMMENDED_BASICS                                                                                        \
   "|exposure/exposure|temperature/temperature|temperature/tint|colorbalancergb/contrast|colorbalancergb/global "        \
-  "vibrance|colorbalancergb/global chroma|colorbalancergb/global saturation|ashift/roration|denoiseprofile|lens|bilat|"
+  "vibrance|colorbalancergb/global chroma|colorbalancergb/global saturation|ashift/rotation|denoiseprofile|lens|bilat|"
 
 // if a preset cannot be loaded or the current preset deleted, this is the fallback preset
 
@@ -154,6 +161,8 @@ typedef enum dt_lib_modulegroup_iop_visibility_type_t
   DT_MODULEGROUP_SEARCH_IOP_GROUPS_VISIBLE,
   DT_MODULEGROUP_SEARCH_IOP_TEXT_GROUPS_VISIBLE
 } dt_lib_modulegroup_iop_visibility_type_t;
+
+static GtkWidget *_active_popover_menu = NULL;
 
 /* toggle button callback */
 static void _lib_modulegroups_toggle(GtkWidget *button, dt_lib_module_t *self);
@@ -402,9 +411,12 @@ static void _basics_hide(dt_lib_module_t *self)
   d->vbox_basic = NULL;
 }
 
-static gboolean _basics_goto_module(GtkWidget *w, GdkEventButton *e, gpointer user_data)
+static void _basics_goto_module(GtkGestureSingle *gesture,
+                                  gint n_press,
+                                  gdouble x,
+                                  gdouble y,
+                                  dt_iop_module_t *module)
 {
-  dt_iop_module_t *module = (dt_iop_module_t *)(user_data);
   dt_dev_modulegroups_switch(darktable.develop, module);
   const gboolean single = dt_conf_get_bool("darkroom/ui/single_module");
   dt_iop_gui_set_expanded(module, TRUE, single);
@@ -413,13 +425,15 @@ static gboolean _basics_goto_module(GtkWidget *w, GdkEventButton *e, gpointer us
   // this second call ensures the module ends up expanded.
   if(single)
     dt_iop_gui_set_expanded(module, TRUE, FALSE);
-  return TRUE;
 }
 
-static gboolean _basics_on_off_label_callback(GtkWidget *widget, GdkEventButton *e, GtkToggleButton *btn)
+static void _basics_on_off_label_callback(GtkGestureSingle *gesture,
+                                          gint n_press,
+                                          gdouble x,
+                                          gdouble y,
+                                          GtkWidget *btn)
 {
-  gtk_toggle_button_set_active(btn, !gtk_toggle_button_get_active(btn));
-  return TRUE;
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn), !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(btn)));
 }
 
 static void _sync_visibility(GtkWidget *widget,
@@ -434,7 +448,21 @@ static void _sync_visibility(GtkWidget *widget,
   gtk_widget_set_visible(item->box, !dt_action_widget_invisible(item->temp_widget));
 }
 
-static gboolean _manage_direct_module_popup(GtkWidget *widget, GdkEventButton *event, dt_lib_module_t *self);
+static void _basics_off_sync(GtkToggleButton *toggle,
+                             GParamSpec *pspec,
+                             GtkWidget *btn)
+{
+  DT_ENTER_GUI_UPDATE();
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn),
+                              gtk_toggle_button_get_active(toggle));
+  DT_LEAVE_GUI_UPDATE();
+}
+
+static void _manage_direct_module_popup(GtkGestureSingle *gesture,
+                                        gint n_press,
+                                        gdouble x,
+                                        gdouble y,
+                                        dt_lib_module_t *self);
 
 static void _basics_add_widget(dt_lib_module_t *self, dt_lib_modulegroups_basic_item_t *item, GtkWidget *w,
                                dt_lib_modulegroups_basic_item_position_t item_pos)
@@ -471,12 +499,19 @@ static void _basics_add_widget(dt_lib_module_t *self, dt_lib_modulegroups_basic_
                                                 dtgtk_cairo_paint_switch,
                                                 DT_ACTION_ELEMENT_ENABLE,
                                                 item->box);
+
+      g_signal_connect_object(G_OBJECT(item->module->off), "notify::active",
+                              G_CALLBACK(_basics_off_sync), btn, 0);
+
       GtkWidget *evb = gtk_event_box_new();
       GtkWidget *lb = gtk_label_new(item->module->name());
       gtk_label_set_xalign(GTK_LABEL(lb), 0.0);
       gtk_widget_set_name(lb, "basics-iop_name");
       gtk_container_add(GTK_CONTAINER(evb), lb);
-      g_signal_connect(G_OBJECT(evb), "button-press-event", G_CALLBACK(_basics_on_off_label_callback), btn);
+      /* Keep the label proxy in sync with the enable button.  In particular,
+       * an insensitive button can still be toggled by set_active(). */
+      gtk_widget_set_sensitive(evb, gtk_widget_get_sensitive(btn));
+      dt_gui_connect_click(evb, _basics_on_off_label_callback, NULL, btn);
       gtk_box_pack_start(GTK_BOX(item->box), evb, FALSE, TRUE, 0);
 
       // disable widget if needed (multiinstance)
@@ -599,7 +634,7 @@ static void _basics_add_widget(dt_lib_module_t *self, dt_lib_modulegroups_basic_
     gtk_container_add(GTK_CONTAINER(evb), header_box);
     gtk_widget_show_all(evb);
     g_object_set_data(G_OBJECT(evb), "module", item->module->so);
-    g_signal_connect(evb, "button-press-event", G_CALLBACK(_manage_direct_module_popup), self);
+    dt_gui_connect_click_secondary(evb, _manage_direct_module_popup, NULL, self);
     gtk_widget_set_name(header_box, "basics-header-box");
     dt_gui_add_class(header_box, "dt_big_btn_canvas");
     gtk_box_pack_start(GTK_BOX(d->vbox_basic), evb, FALSE, FALSE, 0);
@@ -613,14 +648,16 @@ static void _basics_add_widget(dt_lib_module_t *self, dt_lib_modulegroups_basic_
     gtk_widget_show_all(hbox_basic);
 
     // we create the link to the full iop
-    GtkWidget *wbt = dtgtk_button_new(dtgtk_cairo_paint_link, 0, NULL);
-    gtk_widget_show(wbt);
     gchar *tt = g_strdup_printf(_("go to the full version of the %s module"), item->module->name());
-    gtk_widget_set_tooltip_text(wbt, tt);
+    GtkWidget *wbt = dtgtk_button_new_full(dtgtk_cairo_paint_link, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = tt,
+      });
+    gtk_widget_show(wbt);
     gtk_widget_set_name(wbt, "basics-link");
     gtk_widget_set_valign(wbt, GTK_ALIGN_CENTER);
     g_free(tt);
-    g_signal_connect(G_OBJECT(wbt), "button-press-event", G_CALLBACK(_basics_goto_module), item->module);
+    dt_gui_connect_click(wbt, _basics_goto_module, NULL, item->module);
     gtk_box_pack_end(GTK_BOX(compact_ui ? hbox_basic : header_box), wbt, FALSE, FALSE, 0);
 
     // we create a button to open the presets menu
@@ -646,6 +683,9 @@ static void _basics_add_widget(dt_lib_module_t *self, dt_lib_modulegroups_basic_
                                                 dtgtk_cairo_paint_switch,
                                                 DT_ACTION_ELEMENT_ENABLE,
                                                 header_box);
+
+      g_signal_connect_object(G_OBJECT(item->module->off), "notify::active",
+                              G_CALLBACK(_basics_off_sync), btn, 0);
 
       gtk_widget_set_valign(btn, GTK_ALIGN_CENTER);
       dt_gui_add_class(btn, "dt_transparent_background");
@@ -738,6 +778,13 @@ static void _basics_show(dt_lib_module_t *self)
 
   if(d->vbox_basic && gtk_widget_get_visible(d->vbox_basic)) return;
 
+  /* QAP construction creates activation buttons whose callbacks are already
+   * connected before their initial active state is synchronized. Every QAP
+   * rebuild must therefore be a programmatic GUI update, including the path
+   * reached when the last character is deleted from module search. Without
+   * this scope, that initial toggled signal can recursively rebuild QAP. */
+  DT_ENTER_GUI_UPDATE();
+
   if(!d->vbox_basic)
   {
     d->vbox_basic = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -780,6 +827,8 @@ static void _basics_show(dt_lib_module_t *self)
   }
 
   gtk_widget_show(d->vbox_basic);
+
+  DT_LEAVE_GUI_UPDATE();
 }
 
 static uint32_t _lib_modulegroups_get_activated(dt_lib_module_t *self)
@@ -811,7 +860,10 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
   if(d->current == DT_MODULEGROUP_BASICS && !d->basics_show) d->current = DT_MODULEGROUP_ACTIVE_PIPE;
   _basics_hide(self);
 
-  // if we have a module to force, set d-current to active pipe
+  // if we have a module to force or still have none selected, set d-current to active pipe
+  // note: DT_MODULEGROUP_NONE ("all modules", reached by clicking the active group
+  // button again or restored from conf) is a real group state and must be kept;
+  // only INVALID (no selection) is upgraded to the active pipe.
   if(d->current == DT_MODULEGROUP_INVALID) d->current = DT_MODULEGROUP_ACTIVE_PIPE;
 
   const gchar *text_entered = (gtk_widget_is_visible(GTK_WIDGET(d->hbox_search_box)))
@@ -862,7 +914,7 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
       // we don't want the user to mess with those
       if(module->iop_order == INT_MAX)
       {
-        if(darktable.develop->gui_module == module) dt_iop_request_focus(NULL);
+        if(dt_dev_gui_module() == module) dt_iop_request_focus(NULL);
         if(w) gtk_widget_hide(w);
         continue;
       }
@@ -884,7 +936,7 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
         /* don't show deprecated ones unless they are enabled */
         if(module->flags() & IOP_FLAGS_DEPRECATED && !(module->enabled))
         {
-          if(darktable.develop->gui_module == module) dt_iop_request_focus(NULL);
+          if(dt_dev_gui_module() == module) dt_iop_request_focus(NULL);
           if(w) gtk_widget_hide(w);
         }
         else
@@ -953,12 +1005,12 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
 
       if(show_module)
       {
-        if(darktable.develop->gui_module == module && !module->expanded) dt_iop_request_focus(NULL);
+        if(dt_dev_gui_module() == module && !module->expanded) dt_iop_request_focus(NULL);
         if(w) gtk_widget_show(w);
       }
       else
       {
-        if(darktable.develop->gui_module == module) dt_iop_request_focus(NULL);
+        if(dt_dev_gui_module() == module) dt_iop_request_focus(NULL);
         if(w) gtk_widget_hide(w);
       }
 
@@ -966,6 +1018,95 @@ static void _lib_modulegroups_update_iop_visibility(dt_lib_module_t *self)
 
   // we show eventual basic panel but only if no text in the search box
   if(d->current == DT_MODULEGROUP_BASICS && !(text_entered && text_entered[0] != '\0')) _basics_show(self);
+}
+
+/* switch to the given group, or to the all modules view for DT_MODULEGROUP_NONE,
+ * and refresh the panel; shared by the tab buttons and the active button popup.
+ * the caller must hold the gui update lock (DT_TRY_GUI_UPDATE) so the nested
+ * toggled signals from the button state changes below are dropped. */
+static void _lib_modulegroups_switch_to(dt_lib_module_t *self, const int group)
+{
+  dt_lib_modulegroups_t *d = self->data;
+  const int ngroups = g_list_length(d->groups);
+  const dt_iop_module_t *gui_module = dt_dev_gui_module();
+  const gboolean enabled = gui_module ? gui_module->enabled : FALSE;
+
+  /** In some cases the switch to the quick access panel is not safe for
+      various reasons if a module holds gui focus.
+      1)  modules enforcing a crop via IOP_TAG_CROPPING or if they have
+          special drawing code.
+          If enabled it's good to assume that the user has some work
+          left to do so we don't switch and don't fiddle with specials.
+          If not enabled a simple defucus and redraw is good and we can switch.
+      2)  If we are in mask edit mode it's dangerous to switch
+          as there are no visible controls that masks are editied so we don't
+          switch
+      3)  In mask visualizing mode or if we have blend pickers we also don't
+          switch.
+  */
+  if(d->current != DT_MODULEGROUP_BASICS
+      && group == DT_MODULEGROUP_BASICS
+      && gui_module)
+  {
+    if((gui_module->operation_tags() & IOP_TAG_CROPPING)
+      || (gui_module->flags() & IOP_FLAGS_GUIDES_SPECIAL_DRAW))
+    {
+      if(enabled)
+      {
+        dt_control_log(_("close `%s` before switching to quick access panel"), gui_module->name());
+        d->current = DT_MODULEGROUP_NONE;
+        goto update_group;
+      }
+      else
+      {
+        dt_iop_request_focus(NULL);
+        dt_control_queue_redraw_center();
+      }
+    }
+
+    if(gui_module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)
+    {
+      const dt_iop_gui_blend_data_t *bd = gui_module->blend_data;
+      const gboolean mask_edit = bd && enabled && bd->masks_shown != DT_MASKS_EDIT_OFF;
+      const gboolean mask_visual = bd && gui_module->request_mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE;
+      const gboolean picking = bd && gui_module->request_color_pick != DT_REQUEST_COLORPICK_OFF;
+      if(mask_edit || mask_visual || picking)
+      {
+        dt_control_log(_("finish mask work in `%s` before switching to quick access panel"), gui_module->name());
+        d->current = DT_MODULEGROUP_NONE;
+        goto update_group;
+      }
+    }
+  }
+
+  /* deactivate all buttons */
+  for(int k = 0; k <= ngroups; k++)
+  {
+    const GtkWidget *bt = _buttons_get_from_pos(self, k);
+    if(bt) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bt), FALSE);
+  }
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->basic_btn), FALSE);
+
+  if(d->current == DT_MODULEGROUP_BASICS) dt_iop_request_focus(NULL);
+
+  /* the all modules view has no button of its own, so keep them all deactivated */
+  if(group == DT_MODULEGROUP_NONE)
+    d->current = DT_MODULEGROUP_NONE;
+  else
+  {
+    d->current = group;
+    const GtkWidget *bt = _buttons_get_from_pos(self, group);
+    if(bt) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bt), TRUE);
+  }
+
+  /* clear search text */
+  if(gtk_widget_is_visible(GTK_WIDGET(d->hbox_search_box)))
+    gtk_entry_set_text(GTK_ENTRY(d->text_entry), "");
+
+update_group:
+  /* update visibility, this must be reached even if we don't switch */
+  d->force_show_module = NULL;
+  _lib_modulegroups_update_iop_visibility(self);
 }
 
 static void _lib_modulegroups_toggle(GtkWidget *button, dt_lib_module_t *self)
@@ -976,40 +1117,24 @@ static void _lib_modulegroups_toggle(GtkWidget *button, dt_lib_module_t *self)
                                   ? gtk_entry_get_text(GTK_ENTRY(d->text_entry))
                                   : NULL;
 
-  /* deactivate all buttons */
+  /* store toggled modulegroup */
   int gid = 0;
   const int ngroups = g_list_length(d->groups);
   for(int k = 0; k <= ngroups; k++)
   {
     const GtkWidget *bt = _buttons_get_from_pos(self, k);
-    /* store toggled modulegroup */
     if(bt == button)
       gid = k;
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bt), FALSE);
   }
   if(button == d->basic_btn) gid = DT_MODULEGROUP_BASICS;
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->basic_btn), FALSE);
-
-  if(d->current == DT_MODULEGROUP_BASICS) dt_iop_request_focus(NULL);
 
   /* only deselect button if not currently searching else re-enable module */
   if(d->current == gid && gid != DT_MODULEGROUP_BASICS && !(text_entered && text_entered[0] != '\0'))
-    d->current = DT_MODULEGROUP_NONE;
+    _lib_modulegroups_switch_to(self, DT_MODULEGROUP_NONE);
   else
-  {
-    d->current = gid;
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(_buttons_get_from_pos(self, gid)), TRUE);
-  }
-
-  /* clear search text */
-  if(gtk_widget_is_visible(GTK_WIDGET(d->hbox_search_box)))
-    gtk_entry_set_text(GTK_ENTRY(d->text_entry), "");
+    _lib_modulegroups_switch_to(self, gid);
 
   DT_LEAVE_GUI_UPDATE();
-
-  /* update visibility */
-  d->force_show_module = NULL;
-  _lib_modulegroups_update_iop_visibility(self);
 }
 
 typedef struct _set_gui_thread_t
@@ -1022,10 +1147,12 @@ static gboolean _lib_modulegroups_set_gui_thread(gpointer user_data)
 {
   _set_gui_thread_t *params = (_set_gui_thread_t *)user_data;
 
-  /* set current group and update visibility */
-  GtkWidget *bt = _buttons_get_from_pos(params->self, params->group);
-  if(bt) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bt), TRUE);
-  _lib_modulegroups_update_iop_visibility(params->self);
+  /* set current group and update visibility; the button state changes must
+   * not run the toggle handler (restoring the active pipe while it is selected
+   * must not be taken for a click switching to the all modules view) */
+  DT_ENTER_GUI_UPDATE();
+  _lib_modulegroups_switch_to(params->self, params->group);
+  DT_LEAVE_GUI_UPDATE();
 
   free(params);
   return G_SOURCE_REMOVE;
@@ -1048,7 +1175,16 @@ static void _lib_modulegroups_set(dt_lib_module_t *self, uint32_t group)
   if(!params) return;
   params->self = self;
   params->group = group;
-  g_main_context_invoke(NULL, _lib_modulegroups_set_gui_thread, params);
+
+  /* run synchronously on the gui thread: the visibility update must stay in
+   * the same main loop iteration as the caller (e.g. right after the module
+   * list was rebuilt), otherwise every module is visible for at least one
+   * frame before the current group filter applies. only defer when called
+   * from a worker thread. */
+  if(g_main_context_is_owner(g_main_context_default()))
+    _lib_modulegroups_set_gui_thread(params);
+  else
+    g_main_context_invoke(NULL, _lib_modulegroups_set_gui_thread, params);
 }
 
 /* this is a proxy function so it might be called from another thread */
@@ -1057,7 +1193,12 @@ static void _lib_modulegroups_update_visibility_proxy(dt_lib_module_t *self)
   _set_gui_thread_t *params = malloc(sizeof(_set_gui_thread_t));
   if(!params) return;
   params->self = self;
-  g_main_context_invoke(NULL, _lib_modulegroups_upd_gui_thread, params);
+
+  /* same as above: run synchronously on the gui thread */
+  if(g_main_context_is_owner(g_main_context_default()))
+    _lib_modulegroups_upd_gui_thread(params);
+  else
+    g_main_context_invoke(NULL, _lib_modulegroups_upd_gui_thread, params);
 }
 
 static void _lib_modulegroups_switch_group(dt_lib_module_t *self, dt_iop_module_t *module)
@@ -1400,7 +1541,7 @@ static void _preset_from_string(dt_lib_module_t *self, gchar *txt, gboolean edit
 
       for(int j = 3; j < g_strv_length(gr2); j++)
       {
-        dt_lib_modulegroups_basic_item_t *item = g_malloc0(sizeof(dt_lib_modulegroups_basic_item_t));
+        dt_lib_modulegroups_basic_item_t *item = g_try_malloc0(sizeof(dt_lib_modulegroups_basic_item_t));
         if(!item)
           continue;
         item->id = g_strdup(gr2[j]);
@@ -1426,7 +1567,7 @@ static void _preset_from_string(dt_lib_module_t *self, gchar *txt, gboolean edit
       const int nb = g_strv_length(gr2);
       if(nb > 2)
       {
-        dt_lib_modulegroups_group_t *group = g_malloc0(sizeof(dt_lib_modulegroups_group_t));
+        dt_lib_modulegroups_group_t *group = g_try_malloc0(sizeof(dt_lib_modulegroups_group_t));
         if(group)
         {
           group->name = g_strdup(gr2[0]);
@@ -1553,6 +1694,8 @@ void init_presets(dt_lib_module_t *self)
     dt_conf_is_equal("plugins/darkroom/workflow", "scene-referred (sigmoid)");
   const gboolean wf_agx =
     dt_conf_is_equal("plugins/darkroom/workflow", "scene-referred (AgX)");
+  const gboolean wf_spektrafilm =
+    dt_conf_is_equal("plugins/darkroom/workflow", "scene-referred (spektrafilm)");
   const gboolean wf_none =
     dt_conf_is_equal("plugins/darkroom/workflow", "none");
 
@@ -1570,6 +1713,7 @@ void init_presets(dt_lib_module_t *self)
   AM("demosaic");
   AM("exposure");
   AM("finalscale");
+  AM("demosaicscale");
   AM("flip");
   AM("highlights");
   AM("negadoctor");
@@ -1583,11 +1727,13 @@ void init_presets(dt_lib_module_t *self)
   SMG(C_("modulegroup", "tone"), "tone");
   AM("agx");
   AM("bilat");
+  AM("contrastntexture");
   AM("filmicrgb");
   AM("levels");
   AM("rgbcurve");
   AM("rgblevels");
   AM("sigmoid");
+  AM("spektrafilm");
   AM("tonecurve");
 
   SMG(C_("modulegroup", "color"), "color");
@@ -1605,6 +1751,7 @@ void init_presets(dt_lib_module_t *self)
   AM("monochrome");
   AM("profile");
   AM("primaries");
+  AM("satcurvergb");
   AM("gamma");
   AM("velvia");
 
@@ -1752,13 +1899,15 @@ void init_presets(dt_lib_module_t *self)
     AM("sigmoid");
   if(wf_agx || wf_none)
     AM("agx");
+  if(wf_spektrafilm || wf_none)
+    AM("spektrafilm");
   AM("toneequal");
   AM("crop");
   AM("ashift");
   AM("flip");
   AM("exposure");
   AM("temperature");
-  AM("bilat");
+  AM("contrastntexture");
   AM("highlights");
 
   SMG(C_("modulegroup", "color"), "color");
@@ -1767,6 +1916,7 @@ void init_presets(dt_lib_module_t *self)
   AM("colorequal");
   AM("colorharmonizer");
   AM("primaries");
+  AM("satcurvergb");
 
   SMG(C_("modulegroup", "correct"), "correct");
   AM("cacorrect");
@@ -1850,6 +2000,8 @@ static gchar *_presets_get_minimal(dt_lib_module_t *self)
                                               "scene-referred (filmic)");
   const gboolean wf_sigmoid = dt_conf_is_equal("plugins/darkroom/workflow",
                                                "scene-referred (sigmoid)");
+  const gboolean wf_spektrafilm = dt_conf_is_equal("plugins/darkroom/workflow",
+                                                   "scene-referred (spektrafilm)");
   const gboolean wf_agx = dt_conf_is_equal("plugins/darkroom/workflow",
                                                "scene-referred (AgX)");
 
@@ -1869,6 +2021,8 @@ static gchar *_presets_get_minimal(dt_lib_module_t *self)
       AM("sigmoid");
     else if(wf_agx)
       AM("agx");
+    else if(wf_spektrafilm)
+      AM("spektrafilm");
   }
   else
     AM("basecurve");
@@ -2009,12 +2163,14 @@ static void _manage_editor_basics_update_list(dt_lib_module_t *self)
           gtk_box_pack_start(GTK_BOX(hb), lb, FALSE, TRUE, 0);
           if(!d->edit_ro)
           {
-            GtkWidget *btn = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
+            GtkWidget *btn = dtgtk_button_new_full(dtgtk_cairo_paint_remove, 0, NULL,
+              &(dtgtk_button_config_t){
+                .tooltip = _("remove this widget"),
+                .clicked_cb = G_CALLBACK(_manage_editor_basics_remove),
+                .clicked_data = self,
+              });
 
-            gtk_widget_set_tooltip_text(btn, _("remove this widget"));
             g_object_set_data(G_OBJECT(btn), "widget_id", item->id);
-            g_signal_connect(G_OBJECT(btn), "clicked",
-                             G_CALLBACK(_manage_editor_basics_remove), self);
             gtk_box_pack_end(GTK_BOX(hb), btn, FALSE, TRUE, 0);
           }
           gtk_box_pack_start(GTK_BOX(d->edit_basics_box), hb, FALSE, TRUE, 0);
@@ -2132,12 +2288,14 @@ static void _manage_editor_module_update_list(dt_lib_module_t *self,
         gtk_box_pack_start(GTK_BOX(hb), lb, FALSE, TRUE, 0);
         if(!d->edit_ro)
         {
-          GtkWidget *btn = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
-          gtk_widget_set_tooltip_text(btn, _("remove this module"));
+          GtkWidget *btn = dtgtk_button_new_full(dtgtk_cairo_paint_remove, 0, NULL,
+            &(dtgtk_button_config_t){
+              .tooltip = _("remove this module"),
+              .clicked_cb = G_CALLBACK(_manage_editor_module_remove),
+              .clicked_data = self,
+            });
           g_object_set_data(G_OBJECT(btn), "module_name", module->op);
           g_object_set_data(G_OBJECT(btn), "group", gr);
-          g_signal_connect(G_OBJECT(btn), "clicked",
-                           G_CALLBACK(_manage_editor_module_remove), self);
           gtk_box_pack_end(GTK_BOX(hb), btn, FALSE, TRUE, 0);
         }
         gtk_box_pack_start(GTK_BOX(gr->iop_box), hb, FALSE, TRUE, 0);
@@ -2192,11 +2350,21 @@ static void _manage_direct_save(dt_lib_module_t *self)
                          self->plugin_name, self->version());
 }
 
-static void _manage_direct_module_toggle(GtkWidget *widget,
-                                         dt_lib_module_t *self)
+static void _manage_direct_module_toggle(GSimpleAction *action,
+                                         GVariant *parameter,
+                                         gpointer user_data)
 {
-  const gchar *module = (gchar *)g_object_get_data(G_OBJECT(widget), "module_op");
-  dt_lib_modulegroups_group_t *gr = g_object_get_data(G_OBJECT(widget), "group");
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+
+  GVariant *v_module = g_variant_get_child_value(parameter, 0);
+  GVariant *v_group  = g_variant_get_child_value(parameter, 1);
+
+  const gchar *module = g_variant_get_string(v_module, NULL);
+  dt_lib_modulegroups_group_t *gr = (dt_lib_modulegroups_group_t *)g_variant_get_uint64(v_group);
+
+  g_variant_unref(v_module);
+  g_variant_unref(v_group);
+
   if(g_strcmp0(module, "") == 0) return;
 
   GList *found_item = g_list_find_custom(gr->modules, module, _iop_compare);
@@ -2235,7 +2403,7 @@ static int _lib_modulegroups_basics_module_toggle_action(dt_lib_module_t *self,
 
     if(!found_item)
     {
-      dt_lib_modulegroups_basic_item_t *item = g_malloc0(sizeof(dt_lib_modulegroups_basic_item_t));
+      dt_lib_modulegroups_basic_item_t *item = g_try_malloc0(sizeof(dt_lib_modulegroups_basic_item_t));
       if(item)
       {
         item->id = action_id;
@@ -2274,29 +2442,34 @@ static int _lib_modulegroups_basics_module_toggle(dt_lib_module_t *self,
   return _lib_modulegroups_basics_module_toggle_action(self, action, doit);
 }
 
-static void _manage_direct_basics_module_toggle(GtkWidget *widget,
-                                                dt_lib_module_t *self)
+static void _manage_direct_basics_module_toggle(GSimpleAction *action,
+                                                GVariant *parameter,
+                                                gpointer user_data)
 {
-  dt_action_t *action = g_object_get_data(G_OBJECT(widget), "widget_id");
-  if(!action) return;
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
 
-  _lib_modulegroups_basics_module_toggle_action(self, action, TRUE);
+  dt_action_t *m_action = (dt_action_t *)g_variant_get_uint64(parameter);
+  if(!m_action) return;
+
+  _lib_modulegroups_basics_module_toggle_action(self, m_action, TRUE);
 }
 
 
-static void _manage_editor_basics_add(GtkWidget *widget,
-                                      dt_lib_module_t *self)
+static void _manage_editor_basics_add(GSimpleAction *action,
+                                      GVariant *parameter,
+                                      gpointer user_data)
 {
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_modulegroups_t *d = self->data;
 
-  dt_action_t *action = g_object_get_data(G_OBJECT(widget), "widget_id");
-  gchar *action_id = _action_id(action);
+  dt_action_t *m_action = (dt_action_t *)g_variant_get_uint64(parameter);
+  gchar *action_id = _action_id(m_action);
 
   if(g_list_find_custom(d->edit_basics, action_id, _basics_item_find))
     g_free(action_id);
   else
   {
-    dt_lib_modulegroups_basic_item_t *item = g_malloc0(sizeof(dt_lib_modulegroups_basic_item_t));
+    dt_lib_modulegroups_basic_item_t *item = g_try_malloc0(sizeof(dt_lib_modulegroups_basic_item_t));
     if(item)
     {
       item->id = action_id;
@@ -2307,11 +2480,21 @@ static void _manage_editor_basics_add(GtkWidget *widget,
   }
 }
 
-static void _manage_editor_module_add(GtkWidget *widget,
-                                      dt_lib_module_t *self)
+static void _manage_editor_module_add(GSimpleAction *action,
+                                      GVariant *parameter,
+                                      gpointer user_data)
 {
-  const gchar *module = (gchar *)g_object_get_data(G_OBJECT(widget), "module_op");
-  dt_lib_modulegroups_group_t *gr = g_object_get_data(G_OBJECT(widget), "group");
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
+
+  GVariant *v_module = g_variant_get_child_value(parameter, 0);
+  GVariant *v_group  = g_variant_get_child_value(parameter, 1);
+
+  const gchar *module = g_variant_get_string(v_module, NULL);
+  dt_lib_modulegroups_group_t *gr = (dt_lib_modulegroups_group_t *)g_variant_get_uint64(v_group);
+
+  g_variant_unref(v_module);
+  g_variant_unref(v_group);
+
   if(g_strcmp0(module, "") == 0) return;
 
   if(!g_list_find_custom(gr->modules, module, _iop_compare))
@@ -2339,16 +2522,32 @@ static int _manage_editor_module_so_add_sort(gconstpointer a, gconstpointer b)
 
 static void _manage_module_add_popup(GtkWidget *widget,
                                      dt_lib_modulegroups_group_t *gr,
-                                     GCallback callback,
                                      gpointer data,
                                      const gboolean toggle)
 {
-  GtkWidget *pop = gtk_menu_new();
-  gtk_widget_set_name(pop, "modulegroups-popup");
+  GActionGroup *action_group = gtk_widget_get_action_group(widget, "modulegroups");
+  if(action_group == NULL)
+  {
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    GActionEntry action_entries[] =
+    {
+      { "toggle", _manage_direct_module_toggle, "(st)", NULL, NULL },
+      { "add",    _manage_editor_module_add,    "(st)", NULL, NULL }
+    };
+
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    data);
+    gtk_widget_insert_action_group(widget,
+                                    "modulegroups",
+                                    G_ACTION_GROUP(action_group));
+  }
+
+  GMenu *menu = g_menu_new();
+  GMenu *sm_all = g_menu_new();
 
   int nba = 0; // nb of already present items
-
-  GtkMenu *sm_all = (GtkMenu *)gtk_menu_new();
 
   GList *m2 = g_list_sort(g_list_copy(darktable.iop), _manage_editor_module_so_add_sort);
   for(const GList *modules = m2; modules; modules = g_list_next(modules))
@@ -2377,58 +2576,58 @@ static void _manage_module_add_popup(GtkWidget *widget,
            || ((module->default_group() & IOP_GROUP_EFFECTS)
                && g_strcmp0(gr->name, C_("modulegroup", "effects")) == 0))
         {
-          GtkMenuItem *smir = (GtkMenuItem *)gtk_menu_item_new_with_label(module->name());
-          gtk_widget_set_name(GTK_WIDGET(smir), "modulegroups-popup-item");
-          gtk_widget_set_tooltip_text(GTK_WIDGET(smir), _("add this module"));
-          g_object_set_data(G_OBJECT(smir), "module_op", module->op);
-          g_object_set_data(G_OBJECT(smir), "group", gr);
-          g_signal_connect_data(G_OBJECT(smir), "activate", callback, data, NULL, 0);
-          gtk_menu_shell_insert(GTK_MENU_SHELL(pop), GTK_WIDGET(smir), nba);
+          GMenuItem *item = g_menu_item_new(module->name(), NULL);
+          g_menu_item_set_action_and_target_value(item,
+                                                  toggle? "modulegroups.toggle" : "modulegroups.add",
+                                                  g_variant_new("(st)", module->op, (guintptr)gr));
+          g_menu_prepend_item(menu, item);
+          g_object_unref(item);
         }
-        GtkMenuItem *smi = (GtkMenuItem *)gtk_menu_item_new_with_label(module->name());
-        gtk_widget_set_name(GTK_WIDGET(smi), "modulegroups-popup-item2");
-        gtk_widget_set_tooltip_text(GTK_WIDGET(smi), _("add this module"));
-        g_object_set_data(G_OBJECT(smi), "module_op", module->op);
-        g_object_set_data(G_OBJECT(smi), "group", gr);
-        g_signal_connect_data(G_OBJECT(smi), "activate", callback, data, NULL, 0);
-        gtk_menu_shell_prepend(GTK_MENU_SHELL(sm_all), GTK_WIDGET(smi));
+
+        GMenuItem *item = g_menu_item_new(module->name(), NULL);
+        g_menu_item_set_action_and_target_value(item,
+                                                toggle? "modulegroups.toggle" : "modulegroups.add",
+                                                g_variant_new("(st)", module->op, (guintptr)gr));
+        g_menu_prepend_item(sm_all, item);
+        g_object_unref(item);
       }
       else if(toggle)
       {
-        GtkMenuItem *smi = (GtkMenuItem *)gtk_menu_item_new_with_label(module->name());
-        gtk_widget_set_name(GTK_WIDGET(smi), "modulegroups-popup-item");
-        gtk_widget_set_tooltip_text(GTK_WIDGET(smi), _("remove this module"));
-        g_object_set_data(G_OBJECT(smi), "module_op", module->op);
-        g_object_set_data(G_OBJECT(smi), "group", gr);
-        g_signal_connect_data(G_OBJECT(smi), "activate", callback, data, NULL, 0);
-        gtk_menu_shell_insert(GTK_MENU_SHELL(pop), GTK_WIDGET(smi), 0);
+        GMenuItem *item = g_menu_item_new(module->name(), NULL);
+        g_menu_item_set_action_and_target_value(item,
+                                                "modulegroups.toggle",
+                                                g_variant_new("(st)", module->op, (guintptr)gr));
+        g_menu_prepend_item(menu, item);
+        g_object_unref(item);
+
         nba++;
       }
     }
   }
   g_list_free(m2);
 
-  // show the submenu with all the modules
-  GtkWidget *smt = gtk_menu_item_new_with_label(_("all available modules"));
-  gtk_widget_set_name(smt, "modulegroups-popup-item-all");
-  gtk_menu_item_set_submenu(GTK_MENU_ITEM(smt), GTK_WIDGET(sm_all));
-  gtk_menu_shell_append(GTK_MENU_SHELL(pop), smt);
+  GMenu *all_modules_section = menu;
 
-  // show the add/remove sections titles if needed
   if(toggle && nba > 0)
   {
-    smt = gtk_menu_item_new_with_label(_("add module"));
-    gtk_widget_set_name(smt, "modulegroups-popup-title");
-    gtk_widget_set_sensitive(smt, FALSE);
-    gtk_menu_shell_insert(GTK_MENU_SHELL(pop), smt, nba);
+    GMenu *section = menu;
+    menu = g_menu_new();
+    g_menu_append_section(menu, _("remove module"), G_MENU_MODEL(section));
 
-    smt = gtk_menu_item_new_with_label(_("remove module"));
-    gtk_widget_set_name(smt, "modulegroups-popup-title");
-    gtk_widget_set_sensitive(smt, FALSE);
-    gtk_menu_shell_prepend(GTK_MENU_SHELL(pop), smt);
+    all_modules_section = g_menu_new();
+    g_menu_append_section(menu, _("add module"), G_MENU_MODEL(all_modules_section));
   }
 
-  dt_gui_menu_popup(GTK_MENU(pop), widget, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH);
+  // show the submenu with all the modules
+  GMenuItem *item = g_menu_item_new_submenu(_("all available modules"), G_MENU_MODEL(sm_all));
+  g_menu_append_item(all_modules_section, item);
+  g_object_unref(item);
+  g_object_unref(sm_all);
+
+  // popup the menu
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(widget, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
 static gchar *_action_label(dt_action_t *action)
@@ -2444,18 +2643,19 @@ static gchar *_action_label(dt_action_t *action)
     return g_strdup(action->label);
 }
 
-static GtkWidget *_build_menu_from_actions(dt_action_t *actions,
-                                           dt_lib_module_t *self,
-                                           GtkWidget *on_off,
-                                           GtkWidget *base_menu,
-                                           const gboolean full_menu,
-                                           int *num_selected)
+static GMenu *_build_menu_from_actions(dt_action_t *actions,
+                                       dt_lib_module_t *self,
+                                       GMenuItem *on_off,
+                                       GMenu *remove_section,
+                                       GMenu *add_section,
+                                       const gboolean full_menu,
+                                       int *num_selected)
 {
-  GCallback callback = G_CALLBACK(full_menu
-                                  ? _manage_direct_basics_module_toggle
-                                  : _manage_editor_basics_add);
+  const gchar *detailed_action = full_menu ? "qap.toggle"
+                                           : "qap.add";
 
-  GtkWidget *new_base = NULL;
+  GMenu *new_base = NULL;
+
   while(actions)
   {
     if(actions == &darktable.control->actions_focus ||
@@ -2476,7 +2676,8 @@ static GtkWidget *_build_menu_from_actions(dt_action_t *actions,
     }
 
     gchar *action_label = NULL;
-    GtkWidget *item = NULL, *new_sub = NULL;
+    GMenuItem *item = NULL;
+    GMenu *new_sub = NULL;
     dt_action_t *action = NULL;
 
     if(actions->type >= DT_ACTION_TYPE_SECTION && !on_off) // not an iop module or blending (CATEGORY)
@@ -2484,9 +2685,10 @@ static GtkWidget *_build_menu_from_actions(dt_action_t *actions,
       // FIXME don't check here if on/off is enabled, because it
       // depends on image (reload_defaults) respond later to image
       // changed signal
-      on_off = item = gtk_check_menu_item_new_with_label(_("on-off"));
       action = actions->owner;
       action_label = g_strdup_printf("%s - %s", actions->owner->label, _("on-off"));
+
+      on_off = item = g_menu_item_new(action_label, NULL);
 
       // in next loop deal with first actual widget or section
     }
@@ -2494,8 +2696,11 @@ static GtkWidget *_build_menu_from_actions(dt_action_t *actions,
     {
       if(actions->type <= DT_ACTION_TYPE_SECTION)
         new_sub = _build_menu_from_actions(actions->target,
-                                           self, on_off,
-                                           base_menu, full_menu,
+                                           self,
+                                           on_off,
+                                           remove_section,
+                                           add_section,
+                                           full_menu,
                                            num_selected);
 
       if(new_sub
@@ -2503,10 +2708,18 @@ static GtkWidget *_build_menu_from_actions(dt_action_t *actions,
              && actions->target
              && !GTK_IS_BUTTON(actions->target)))
       {
-        item = new_sub ? gtk_menu_item_new_with_label(actions->label)
-                       : gtk_check_menu_item_new_with_label(actions->label);
         action = actions;
         action_label = _action_label(actions);
+
+        // TODO: Gtk4:
+        // prefix the parent's label: gtk3 flattens GtkPopoverMenu into a single
+        // GtkStack and names each page after its item label, so equally named
+        // submenus under different modules collide and navigation follows the
+        // first one. under gtk4 dt_gui_popover_menu_from_model() nests the menu
+        // for real (GTK_POPOVER_MENU_NESTED) and the prefix can go
+        item = g_menu_item_new(action_label, NULL);
+        // Gtk4:
+        // item = g_menu_item_new(actions->label, NULL);
       }
 
       actions = actions->next;
@@ -2514,84 +2727,63 @@ static GtkWidget *_build_menu_from_actions(dt_action_t *actions,
 
     if(item)
     {
-      gtk_widget_set_name(item, "modulegroups-popup-item2");
-
       if(!new_base)
-        new_base = gtk_menu_new();
-      gtk_menu_shell_append(GTK_MENU_SHELL(new_base), item);
+        new_base = g_menu_new();
 
       if(new_sub)
-        gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), new_sub);
+        g_menu_item_set_submenu(item, G_MENU_MODEL(new_sub));
+      else
+        g_menu_item_set_action_and_target_value(item,
+                                                detailed_action,
+                                                g_variant_new_uint64((guintptr)action));
+
+      g_menu_append_item(new_base, item);
+
+      if(new_sub)
+        g_object_unref(new_sub);
       else
       {
         dt_lib_modulegroups_t *d = self->data;
-
-        GtkWidget *item_top = NULL;
-
+        GMenuItem *item_top = NULL;
         gchar *action_id = _action_id(action);
+
         if(g_list_find_custom(full_menu
                               ? d->basics
                               : d->edit_basics,
                               action_id, _basics_item_find))
         {
-          gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(item), TRUE);
-          if(!full_menu)
-            gtk_widget_set_sensitive(item, FALSE);
-          else
-            gtk_widget_set_tooltip_text(item, _("remove this widget"));
-
-          const gboolean compact_ui =
-            !dt_conf_get_bool("plugins/darkroom/modulegroups_basics_sections_labels");
-          if(!compact_ui && item != on_off)
-          {
-            gtk_check_menu_item_set_inconsistent(GTK_CHECK_MENU_ITEM(on_off), TRUE);
-            gtk_widget_set_tooltip_text(on_off, _("header needed for other widgets"));
-          }
-
           if(full_menu)
           {
-            item_top = gtk_menu_item_new_with_label(action_label);;
-            gtk_widget_set_tooltip_text(item_top, _("remove this widget"));
-            gtk_widget_set_name(item_top, "modulegroups-popup-item");
-            g_object_set_data(G_OBJECT(item_top), "widget_id", action);
-            g_signal_connect_data(G_OBJECT(item_top), "activate", callback, self, NULL, 0);
-            gtk_menu_shell_insert(GTK_MENU_SHELL(base_menu), item_top, *num_selected);
+            item_top = g_menu_item_new(action_label, NULL);
+            g_menu_item_set_action_and_target_value(item_top,
+                                                    detailed_action,
+                                                    g_variant_new_uint64((guintptr)action));
+            g_menu_append_item(remove_section, item_top);
+            g_object_unref(item_top);
+
             ++*num_selected;
           }
         }
         else
         {
-          gtk_widget_set_tooltip_text(item, _("add this widget"));
-
           gchar *delimited_id = g_strdup_printf("|%s|", action_id);
 
           if(strstr(RECOMMENDED_BASICS, delimited_id))
           {
-            item_top = gtk_menu_item_new_with_label(action_label);;
-            gtk_widget_set_tooltip_text(item_top, _("add this widget"));
-            gtk_widget_set_name(item_top, "modulegroups-popup-item");
-            g_object_set_data(G_OBJECT(item_top), "widget_id", action);
-            g_signal_connect_data(G_OBJECT(item_top), "activate", callback, self, NULL, 0);
-            gtk_menu_shell_append(GTK_MENU_SHELL(base_menu), item_top);
+            item_top = g_menu_item_new(action_label, NULL);
+            g_menu_item_set_action_and_target_value(item_top,
+                                                    detailed_action,
+                                                    g_variant_new_uint64((guintptr)action));
+            g_menu_append_item(add_section, item_top);
+            g_object_unref(item_top);
           }
           g_free(delimited_id);
         }
 
-        if(item != on_off && dt_action_widget_invisible(action->target))
-        {
-          gtk_check_menu_item_set_inconsistent(GTK_CHECK_MENU_ITEM(item), TRUE);
-          gchar *toolmark = gtk_widget_get_tooltip_text(item);
-          dt_util_str_cat(&toolmark, " <i>(%s)</i>", _("currently invisible"));
-          gtk_widget_set_tooltip_markup(item, toolmark);
-          if(item_top)
-            gtk_widget_set_tooltip_markup(item_top, toolmark);
-          g_free(toolmark);
-        }
-
-        g_object_set_data(G_OBJECT(item), "widget_id", action);
-        g_signal_connect_data(G_OBJECT(item), "activate", callback, self, NULL, 0);
         g_free(action_id);
       }
+
+      g_object_unref(item);
       g_free(action_label);
     }
   }
@@ -2599,49 +2791,61 @@ static GtkWidget *_build_menu_from_actions(dt_action_t *actions,
   return new_base;
 }
 
+static void _set_action_group(GtkWidget *widget,
+                              dt_lib_module_t *self)
+{
+  GActionGroup *action_group = gtk_widget_get_action_group(widget, "qap");
+  if(action_group == NULL)
+  {
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    GActionEntry action_entries[] =
+    {
+      { "toggle", _manage_direct_basics_module_toggle, "t", NULL, NULL },
+      { "add",    _manage_editor_basics_add,           "t", NULL, NULL }
+    };
+
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(widget,
+                                    "qap",
+                                    G_ACTION_GROUP(action_group));
+  }
+}
+
 static void _manage_basics_add_popup(GtkWidget *widget,
                                      dt_lib_module_t *self,
                                      const gboolean full_menu)
 {
+  _set_action_group(widget, self);
+
   int nba = 0; // nb of already present items
-  GtkWidget *pop = gtk_menu_new();
-  gtk_widget_set_name(pop, "modulegroups-popup");
+  GMenu *menu = g_menu_new();
+  GMenu *remove_section = g_menu_new();
+  GMenu *add_section = g_menu_new();
 
-  GtkWidget *all_modules =
+  GMenu *all_modules =
     _build_menu_from_actions(darktable.control->actions_iops.target, self, NULL,
-                             pop, full_menu, &nba);
+                             remove_section, add_section, full_menu, &nba);
 
-  // show the add/remove sections titles if needed
-  if(full_menu && nba > 0)
-  {
-    GtkWidget *smt = gtk_menu_item_new_with_label(_("add widget"));
-    gtk_widget_set_name(smt, "modulegroups-popup-title");
-    gtk_widget_set_sensitive(smt, FALSE);
-    gtk_menu_shell_insert(GTK_MENU_SHELL(pop), smt, nba);
+  GMenu *all_modules_section = menu;
 
-    smt = gtk_menu_item_new_with_label(_("remove widget"));
-    gtk_widget_set_name(smt, "modulegroups-popup-title");
-    gtk_widget_set_sensitive(smt, FALSE);
-    gtk_menu_shell_prepend(GTK_MENU_SHELL(pop), smt);
-  }
+  g_menu_append_section(menu, _("remove widget"), G_MENU_MODEL(remove_section));
+  g_object_unref(remove_section);
 
-  GList *children = gtk_container_get_children(GTK_CONTAINER(pop));
-  if(children)
-  {
-    g_list_free(children);
+  g_menu_append_section(menu, _("add widget"), G_MENU_MODEL(add_section));
+  g_object_unref(add_section);
 
-    GtkWidget *smt = gtk_menu_item_new_with_label(_("all available modules"));
-    gtk_widget_set_name(smt, "modulegroups-popup-item-all");
-    gtk_menu_item_set_submenu(GTK_MENU_ITEM(smt), GTK_WIDGET(all_modules));
-    gtk_menu_shell_append(GTK_MENU_SHELL(pop), smt);
-  }
-  else
-  {
-    gtk_widget_destroy(pop);
-    pop = all_modules;
-  }
+  GMenuItem *item = g_menu_item_new_submenu(_("all available modules"), G_MENU_MODEL(all_modules));
+  g_menu_append_item(all_modules_section, item);
+  g_object_unref(item);
+  g_object_unref(all_modules);
 
-  dt_gui_menu_popup(GTK_MENU(pop), widget, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH);
+  // popup the menu
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(widget, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
 static void _manage_editor_basics_add_popup(GtkWidget *widget,
@@ -2654,107 +2858,218 @@ static void _manage_editor_module_add_popup(GtkWidget *widget,
                                             dt_lib_module_t *self)
 {
   dt_lib_modulegroups_group_t *gr = g_object_get_data(G_OBJECT(widget), "group");
-  _manage_module_add_popup(widget, gr,
-                           G_CALLBACK(_manage_editor_module_add), self, FALSE);
+  _manage_module_add_popup(widget, gr, self, FALSE);
 }
 
-static gboolean _presets_pressed(GtkWidget *widget,
-                                 GdkEventButton *event,
-                                 dt_lib_module_t *self)
+static void _presets_pressed_cb(GtkGestureSingle *gesture,
+                                int n_press,
+                                double x,
+                                double y,
+                                dt_lib_module_t *self)
 {
-  if(dt_modifier_is(dt_gdk_event_get_state(event), GDK_CONTROL_MASK))
+  const GdkModifierType state =
+    dt_gui_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
+  if(state & GDK_CONTROL_MASK)
   {
     manage_presets(self);
-    return TRUE;
+    dt_gui_claim(gesture);
   }
-  return FALSE;
 }
 
-static gboolean _manage_direct_popup(GtkWidget *widget,
-                                     GdkEventButton *event,
-                                     dt_lib_module_t *self)
+static void _manage_direct_popup(GtkGestureSingle *gesture,
+                                 gint n_press,
+                                 gdouble x,
+                                 gdouble y,
+                                 dt_lib_module_t *self)
 {
-  if(dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY)
+  // this gesture only serves right clicks; a primary press would be a
+  // shortcut-activated toggle effect (see dt_gui_current_button in gtk.h)
+  if(dt_gui_current_button(gesture) != GDK_BUTTON_SECONDARY) return;
+  GtkWidget *widget = dt_gui_get_widget(gesture);
+  dt_lib_modulegroups_group_t *gr = g_object_get_data(G_OBJECT(widget), "group");
+  if(!g_strcmp0(gr->name, C_("modulegroup", "deprecated"))) return;
+  _manage_module_add_popup(widget, gr, self, TRUE);
+}
+
+static void _manage_direct_basic_popup(GtkGestureSingle *gesture,
+                                       gint n_press,
+                                       gdouble x,
+                                       gdouble y,
+                                       dt_lib_module_t *self)
+{
+  /* a shortcut-activated primary press (toggle/on/off effect, see
+   * dt_gui_current_button() in gtk.h) flips the button; real clicks on
+   * this secondary-only gesture are always secondary and open the popup */
+  if(dt_gui_current_button(gesture) == GDK_BUTTON_PRIMARY)
   {
-    dt_lib_modulegroups_group_t *gr = g_object_get_data(G_OBJECT(widget), "group");
-    if(!g_strcmp0(gr->name, C_("modulegroup", "deprecated"))) return FALSE;
-    _manage_module_add_popup(widget, gr,
-                             G_CALLBACK(_manage_direct_module_toggle), self, TRUE);
-    return TRUE;
+    GtkWidget *widget = dt_gui_get_widget(gesture);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget),
+                                 !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget)));
+    return;
   }
-  return FALSE;
+  _manage_basics_add_popup(dt_gui_get_widget(gesture), self, TRUE);
 }
 
-static gboolean _manage_direct_basic_popup(GtkWidget *widget,
-                                           GdkEventButton *event,
-                                           dt_lib_module_t *self)
+static void _manage_direct_module_popup(GtkGestureSingle *gesture,
+                                        gint n_press,
+                                        gdouble x,
+                                        gdouble y,
+                                        dt_lib_module_t *self)
 {
-  if(dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY)
-  {
-    _manage_basics_add_popup(widget, self, TRUE);
-    return TRUE;
-  }
-  return FALSE;
-}
-
-static gboolean _manage_direct_module_popup(GtkWidget *widget,
-                                            GdkEventButton *event,
-                                            dt_lib_module_t *self)
-{
+  // this gesture only serves right clicks; a primary press would be a
+  // shortcut-activated toggle effect (see dt_gui_current_button in gtk.h)
+  if(dt_gui_current_button(gesture) != GDK_BUTTON_SECONDARY) return;
+  GtkWidget *widget = dt_gui_get_widget(gesture);
   dt_action_t *module = g_object_get_data(G_OBJECT(widget), "module");
 
-  if(dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY)
-  {
-    int nba = 0; // nb of already present items
-    GtkWidget *pop = gtk_menu_new();
-    gtk_widget_set_name(pop, "modulegroups-popup");
+  _set_action_group(widget, self);
 
-    GtkWidget *this_module = _build_menu_from_actions(module->target, self,
-                                                      NULL, pop, TRUE, &nba);
+  int nba = 0; // nb of already present items
+  GMenu *remove_section = g_menu_new();
+  GMenu *add_section = g_menu_new();
 
-    dt_gui_menu_popup(GTK_MENU(this_module), NULL, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH);
+  GMenu *this_module = _build_menu_from_actions(module->target,
+                                                self,
+                                                NULL,
+                                                remove_section,
+                                                add_section,
+                                                TRUE,
+                                                &nba);
 
-    return TRUE;
-  }
-  return FALSE;
+  g_object_unref(remove_section);
+  g_object_unref(add_section);
+
+  // popup the menu
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(widget, this_module);
+  g_object_unref(this_module);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
-static void _manage_direct_full_active_toggled(GtkWidget *widget,
-                                               dt_lib_module_t *self)
+/* display modes offered by the active button popup */
+typedef enum dt_lib_modulegroup_popup_mode_t
 {
+  DT_MODULEGROUP_POPUP_ALL = 0,          /* show every module */
+  DT_MODULEGROUP_POPUP_ACTIVE_HISTORY,   /* active pipe, incl. history modules */
+  DT_MODULEGROUP_POPUP_ACTIVE            /* active pipe only */
+} dt_lib_modulegroup_popup_mode_t;
+
+static void _manage_direct_active_mode_toggled(GSimpleAction *action,
+                                               GVariant *parameter,
+                                               gpointer user_data)
+{
+  dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_modulegroups_t *d = self->data;
-  d->full_active = gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(widget));
-  const int cur = d->current;
-  _manage_direct_save(self);
-  d->current = cur;
-  _lib_modulegroups_update_iop_visibility(self);
+
+  const dt_lib_modulegroup_popup_mode_t mode = g_variant_get_int32(parameter);
+
+  switch(mode)
+  {
+    case DT_MODULEGROUP_POPUP_ALL:
+      DT_TRY_GUI_UPDATE();
+      _lib_modulegroups_switch_to(self, DT_MODULEGROUP_NONE);
+      DT_LEAVE_GUI_UPDATE();
+      break;
+
+    case DT_MODULEGROUP_POPUP_ACTIVE_HISTORY:
+    case DT_MODULEGROUP_POPUP_ACTIVE:
+    {
+      /* full_active is part of the modulegroups preset, so persist it */
+      d->full_active = (mode == DT_MODULEGROUP_POPUP_ACTIVE_HISTORY);
+      const int cur = d->current;
+      _manage_direct_save(self);
+      d->current = cur;
+
+      DT_TRY_GUI_UPDATE();
+      _lib_modulegroups_switch_to(self, DT_MODULEGROUP_ACTIVE_PIPE);
+      DT_LEAVE_GUI_UPDATE();
+      break;
+    }
+  }
+
+  // close the menu
+  gtk_popover_popdown(GTK_POPOVER(_active_popover_menu));
 }
 
-static gboolean _manage_direct_active_popup(GtkWidget *widget,
-                                            GdkEventButton *event,
-                                            dt_lib_module_t *self)
+static void _manage_direct_active_popup(GtkGestureSingle *gesture,
+                                        gint n_press,
+                                        gdouble x,
+                                        gdouble y,
+                                        dt_lib_module_t *self)
 {
-  if(dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS && dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY)
+  GtkWidget *widget = dt_gui_get_widget(gesture);
+
+  /* a shortcut-activated primary press (toggle/on/off effect, see
+   * dt_gui_current_button() in gtk.h) flips the button; real clicks on
+   * this secondary-only gesture are always secondary and open the popup */
+  if(dt_gui_current_button(gesture) == GDK_BUTTON_PRIMARY)
   {
-    dt_lib_modulegroups_t *d = self->data;
-    GtkWidget *pop = gtk_menu_new();
-    gtk_widget_set_name(pop, "modulegroups-popup");
-
-    GtkWidget *smt = gtk_check_menu_item_new_with_label(_("show all history modules"));
-    gtk_widget_set_tooltip_text(
-        smt,
-        _("show modules that are present in the history stack,"
-          " regardless of whether or not they are currently enabled"));
-    gtk_widget_set_name(smt, "modulegroups-popup-item");
-    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(smt), d->full_active);
-    g_signal_connect(G_OBJECT(smt), "toggled",
-                     G_CALLBACK(_manage_direct_full_active_toggled), self);
-    gtk_menu_shell_append(GTK_MENU_SHELL(pop), smt);
-
-    dt_gui_menu_popup(GTK_MENU(pop), widget, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH);
-    return TRUE;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget),
+                                 !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget)));
+    return;
   }
-  return FALSE;
+
+  GActionGroup *action_group = gtk_widget_get_action_group(widget, "activemodules");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "toggle", _manage_direct_active_mode_toggled, "i",  "0" }
+    };
+
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    self);
+    gtk_widget_insert_action_group(widget,
+                                   "activemodules",
+                                   G_ACTION_GROUP(action_group));
+  }
+
+
+
+  GMenu *menu = g_menu_new();
+  GMenuItem *item;
+
+  item = g_menu_item_new(_("show all modules"), NULL);
+  g_menu_item_set_action_and_target_value(item,
+                                          "activemodules.toggle",
+                                          g_variant_new("i", DT_MODULEGROUP_POPUP_ALL));
+  g_menu_append_item(menu, item);
+  g_object_unref(item);
+
+  item = g_menu_item_new(_("show active and history modules"), NULL);
+  g_menu_item_set_action_and_target_value(item,
+                                          "activemodules.toggle",
+                                          g_variant_new("i", DT_MODULEGROUP_POPUP_ACTIVE_HISTORY));
+  g_menu_append_item(menu, item);
+  g_object_unref(item);
+
+  item = g_menu_item_new(_("show active modules only"), NULL);
+  g_menu_item_set_action_and_target_value(item,
+                                          "activemodules.toggle",
+                                          g_variant_new("i", DT_MODULEGROUP_POPUP_ACTIVE));
+  g_menu_append_item(menu, item);
+  g_object_unref(item);
+
+  // mark the active item
+  dt_lib_modulegroups_t *d = self->data;
+
+  dt_lib_modulegroup_popup_mode_t current;
+  if(d->current == DT_MODULEGROUP_ACTIVE_PIPE && d->full_active)
+    current = DT_MODULEGROUP_POPUP_ACTIVE_HISTORY;
+  else if(d->current == DT_MODULEGROUP_ACTIVE_PIPE && !d->full_active)
+    current = DT_MODULEGROUP_POPUP_ACTIVE;
+  else
+    current = DT_MODULEGROUP_POPUP_ALL;
+
+  GAction *item_action = g_action_map_lookup_action(G_ACTION_MAP(action_group), "toggle");
+  g_simple_action_set_state(G_SIMPLE_ACTION(item_action), g_variant_new("i", current));
+
+  // popup the menu
+  _active_popover_menu = dt_gui_popover_menu_from_model(widget, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(_active_popover_menu));
 }
 
 static void _dt_dev_image_changed_callback(gpointer instance,
@@ -2834,13 +3149,16 @@ static void _dt_dev_image_changed_callback(gpointer instance,
 
 }
 
-static gboolean _scroll_group_buttons(GtkWidget *widget,
-                                      GdkEventScroll *event,
-                                      dt_lib_module_t *self)
+static void _scroll_group_buttons(GtkEventControllerScroll *controller,
+                                   gdouble dx,
+                                   gdouble dy,
+                                   dt_lib_module_t *self)
 {
   dt_lib_modulegroups_t *d = self->data;
-  int delta;
-  if(dt_gui_get_scroll_unit_delta(event, &delta))
+  int delta = (dy > 0) ? 1 : (dy < 0) ? -1 : 0;
+  if(delta == 0)
+    delta = (dx > 0) ? -1 : (dx < 0) ? 1 : 0;
+  if(delta != 0)
   {
     GtkWidget *adjacent = d->current == DT_MODULEGROUP_BASICS && delta < 0
                         ? d->active_btn
@@ -2849,8 +3167,6 @@ static gboolean _scroll_group_buttons(GtkWidget *widget,
                         : _buttons_get_from_pos(self, d->current - delta);
     if(adjacent) gtk_button_clicked(GTK_BUTTON(adjacent));
   }
-
-  return TRUE;
 }
 
 // cycle module groups action
@@ -2963,34 +3279,40 @@ void gui_init(dt_lib_module_t *self)
   d->hbox_groups = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
   GtkWidget *scrollbox = gtk_event_box_new();
   gtk_container_add(GTK_CONTAINER(scrollbox), d->hbox_groups);
-  g_signal_connect(scrollbox, "scroll-event",
-                   G_CALLBACK(_scroll_group_buttons), self);
-  gtk_widget_add_events(scrollbox, darktable.gui->scroll_mask);
+  dt_gui_connect_scroll(scrollbox,
+                        GTK_EVENT_CONTROLLER_SCROLL_VERTICAL
+                          | GTK_EVENT_CONTROLLER_SCROLL_DISCRETE,
+                        _scroll_group_buttons, self);
   gtk_box_pack_start(GTK_BOX(d->hbox_buttons), scrollbox, TRUE, TRUE, 0);
 
   // basic group button
-  d->basic_btn = dtgtk_togglebutton_new(dtgtk_cairo_paint_modulegroup_basics, 0, NULL);
-  g_signal_connect(d->basic_btn, "button-press-event",
-                   G_CALLBACK(_manage_direct_basic_popup), self);
-  g_signal_connect(d->basic_btn, "toggled", G_CALLBACK(_lib_modulegroups_toggle), self);
-  gtk_widget_set_tooltip_text(d->basic_btn, _("quick access panel\n"
-                                              "right-click tab icon to add/remove widgets"));
-  dt_action_define(DT_ACTION(self), NULL,
-                   N_("quick access panel"), d->basic_btn, &dt_action_def_toggle);
+  d->basic_btn = dtgtk_togglebutton_new_full(dtgtk_cairo_paint_modulegroup_basics, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("quick access panel\n"
+          "right-click tab icon to add/remove widgets"),
+        .action = DT_ACTION(self),
+        .action_label = N_("quick access panel"),
+        .action_def = &dt_action_def_toggle,
+        .toggled_cb = G_CALLBACK(_lib_modulegroups_toggle),
+        .toggled_data = self,
+      });
+  dt_gui_connect_click_secondary(d->basic_btn, _manage_direct_basic_popup, NULL, self);
   gtk_box_pack_start(GTK_BOX(d->hbox_groups), d->basic_btn, TRUE, TRUE, 0);
 
   d->vbox_basic = NULL;
   d->basics = NULL;
 
   // active group button
-  d->active_btn = dtgtk_togglebutton_new(dtgtk_cairo_paint_modulegroup_active, 0, NULL);
-  g_signal_connect(d->active_btn, "button-press-event",
-                   G_CALLBACK(_manage_direct_active_popup), self);
-  g_signal_connect(d->active_btn, "toggled",
-                   G_CALLBACK(_lib_modulegroups_toggle), self);
-  gtk_widget_set_tooltip_text(d->active_btn, _("show only active modules"));
-  dt_action_define(DT_ACTION(self), NULL, N_("active modules"),
-                   d->active_btn, &dt_action_def_toggle);
+  d->active_btn = dtgtk_togglebutton_new_full(dtgtk_cairo_paint_modulegroup_active, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("show only active modules"),
+        .action = DT_ACTION(self),
+        .action_label = N_("active modules"),
+        .action_def = &dt_action_def_toggle,
+        .toggled_cb = G_CALLBACK(_lib_modulegroups_toggle),
+        .toggled_data = self,
+      });
+  dt_gui_connect_click_secondary(d->active_btn, _manage_direct_active_popup, NULL, self);
   gtk_box_pack_start(GTK_BOX(d->hbox_groups), d->active_btn, TRUE, TRUE, 0);
 
   // cycle module groups action
@@ -2998,11 +3320,12 @@ void gui_init(dt_lib_module_t *self)
     DT_ACTION(self), NULL, N_("cycle module groups"), NULL, &_action_def_cycle_module_groups);
 
   // we load now the presets btn
-  self->presets_button = dtgtk_button_new(dtgtk_cairo_paint_presets, 0, NULL);
-  gtk_widget_set_tooltip_text(self->presets_button, _("presets\nctrl+click to manage"));
+  self->presets_button = dtgtk_button_new_full(dtgtk_cairo_paint_presets, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("presets\nctrl+click to manage"),
+      });
   gtk_box_pack_start(GTK_BOX(d->hbox_buttons), self->presets_button, FALSE, FALSE, 0);
-  g_signal_connect(self->presets_button, "button-press-event",
-                   G_CALLBACK(_presets_pressed), self);
+  dt_gui_connect_click(self->presets_button, _presets_pressed_cb, NULL, self);
 
   /* search box */
   d->text_entry = gtk_search_entry_new();
@@ -3037,8 +3360,16 @@ void gui_init(dt_lib_module_t *self)
   gtk_label_set_line_wrap(GTK_LABEL(d->deprecated), TRUE);
   gtk_box_pack_start(GTK_BOX(self->widget), d->deprecated, TRUE, TRUE, 0);
 
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->active_btn), TRUE);
   d->current = dt_conf_get_int("plugins/darkroom/groups");
+
+  /* press the active button without running the toggle handler: the real
+   * selection was just restored from conf, and activating the active button
+   * while it is selected would switch to the all modules view */
+  DT_ENTER_GUI_UPDATE();
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->active_btn),
+                               d->current != DT_MODULEGROUP_NONE);
+  DT_LEAVE_GUI_UPDATE();
+
   if(d->current == DT_MODULEGROUP_NONE) _lib_modulegroups_update_iop_visibility(self);
   gtk_widget_show_all(self->widget);
   gtk_widget_set_no_show_all(d->deprecated, TRUE);
@@ -3136,13 +3467,16 @@ static void _buttons_update(dt_lib_module_t *self)
   for(l = d->groups; l; l = g_list_next(l))
   {
     dt_lib_modulegroups_group_t *gr = l->data;
-    GtkWidget *bt = dtgtk_togglebutton_new(_buttons_get_icon_fct(gr->icon), 0, NULL);
-    g_object_set_data(G_OBJECT(bt), "group", gr);
-    g_signal_connect(bt, "button-press-event", G_CALLBACK(_manage_direct_popup), self);
-    g_signal_connect(bt, "toggled", G_CALLBACK(_lib_modulegroups_toggle), self);
     char *tooltip = g_strdup_printf(_("%s\nright-click tab icon to add/remove modules"), gr->name);
-    gtk_widget_set_tooltip_text(bt, tooltip);
+    GtkWidget *bt = dtgtk_togglebutton_new_full(_buttons_get_icon_fct(gr->icon), 0, NULL,
+        &(dtgtk_button_config_t){
+          .tooltip = tooltip,
+          .toggled_cb = G_CALLBACK(_lib_modulegroups_toggle),
+          .toggled_data = self,
+        });
     g_free(tooltip);
+    g_object_set_data(G_OBJECT(bt), "group", gr);
+    dt_gui_connect_click_secondary(bt, _manage_direct_popup, NULL, self);
     gr->button = bt;
     gtk_box_pack_start(GTK_BOX(d->hbox_groups), bt, TRUE, TRUE, 0);
     gtk_widget_show(bt);
@@ -3156,26 +3490,12 @@ static void _buttons_update(dt_lib_module_t *self)
     d->current = DT_MODULEGROUP_ACTIVE_PIPE;
   }
 
-  if(d->current == DT_MODULEGROUP_ACTIVE_PIPE)
-  {
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->active_btn), TRUE);
-  }
-  else if(d->current == DT_MODULEGROUP_BASICS)
-  {
-    if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(d->basic_btn)))
-    {
-      // we need to manually refresh the list
-      _lib_modulegroups_update_iop_visibility(self);
-    }
-    else
-      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->basic_btn), TRUE);
-  }
-  else
-  {
-    dt_lib_modulegroups_group_t *gr = g_list_nth_data(d->groups, d->current - 1);
-    d->current = DT_MODULEGROUP_NONE;
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(gr->button), TRUE);
-  }
+  /* restore the selected group; the button presses must not run the toggle
+   * handler (restoring the active pipe while it is selected must not be
+   * taken for a click switching to the all modules view) */
+  DT_ENTER_GUI_UPDATE();
+  _lib_modulegroups_switch_to(self, d->current);
+  DT_LEAVE_GUI_UPDATE();
 }
 
 static void _manage_editor_group_move_right(GtkWidget *widget,
@@ -3256,10 +3576,13 @@ static void _manage_editor_group_name_changed(GtkWidget *tb,
   gr->name = g_strdup(txt);
 }
 
-static gboolean _manage_editor_group_icon_changed(GtkWidget *widget,
-                                              GdkEventButton *event,
-                                              dt_lib_modulegroups_group_t *gr)
+static void _manage_editor_group_icon_changed(GtkGestureSingle *gesture,
+                                             gint n_press,
+                                             gdouble x,
+                                             gdouble y,
+                                             dt_lib_modulegroups_group_t *gr)
 {
+  GtkWidget *widget = dt_gui_get_widget(gesture);
   const char *ic = (char *)g_object_get_data(G_OBJECT(widget), "ic_name");
   g_free(gr->icon);
   gr->icon = g_strdup(ic);
@@ -3267,7 +3590,6 @@ static gboolean _manage_editor_group_icon_changed(GtkWidget *widget,
   GtkWidget *btn = gtk_popover_get_relative_to(GTK_POPOVER(pop));
   dtgtk_button_set_paint(DTGTK_BUTTON(btn), _buttons_get_icon_fct(ic), 0, NULL);
   gtk_popover_popdown(GTK_POPOVER(pop));
-  return TRUE;
 }
 
 static void _manage_editor_group_icon_popup(GtkWidget *btn,
@@ -3286,8 +3608,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("basic icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "basic");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3297,8 +3618,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("active icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "active");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3308,8 +3628,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("color icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "color");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3319,8 +3638,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("correct icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "correct");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3330,8 +3648,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("effect icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "effect");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3341,8 +3658,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("favorites icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "favorites");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3352,8 +3668,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("tone icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "tone");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3363,8 +3678,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("grading icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "grading");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3374,8 +3688,7 @@ static void _manage_editor_group_icon_popup(GtkWidget *btn,
   gtk_box_pack_start(GTK_BOX(hb), ic, FALSE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("technical icon")), TRUE, TRUE, 0);
   g_object_set_data(G_OBJECT(eb), "ic_name", "technical");
-  g_signal_connect(G_OBJECT(eb), "button-press-event",
-                   G_CALLBACK(_manage_editor_group_icon_changed), gr);
+  dt_gui_connect_click_all(eb, _manage_editor_group_icon_changed, NULL, gr);
   gtk_container_add(GTK_CONTAINER(eb), hb);
   gtk_box_pack_start(GTK_BOX(vb), eb, FALSE, TRUE, 0);
 
@@ -3428,12 +3741,13 @@ static GtkWidget *_manage_editor_group_init_basics_box(dt_lib_module_t *self)
   if(!d->edit_ro)
   {
     GtkWidget *hb4 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    GtkWidget *bt = dtgtk_button_new(dtgtk_cairo_paint_square_plus,
-                                     CPF_DIRECTION_LEFT, NULL);
-    gtk_widget_set_tooltip_text(bt, _("add widget to the quick access panel"));
+    GtkWidget *bt = dtgtk_button_new_full(dtgtk_cairo_paint_square_plus, CPF_DIRECTION_LEFT, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("add widget to the quick access panel"),
+        .clicked_cb = G_CALLBACK(_manage_editor_basics_add_popup),
+        .clicked_data = self,
+      });
     gtk_widget_set_name(bt, "modulegroups-btn");
-    g_signal_connect(G_OBJECT(bt), "clicked",
-                     G_CALLBACK(_manage_editor_basics_add_popup), self);
     gtk_widget_set_halign(hb4, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(hb4), bt, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vb2), hb4, FALSE, FALSE, 0);
@@ -3461,12 +3775,14 @@ static GtkWidget *_manage_editor_group_init_modules_box(dt_lib_module_t *self,
   gtk_widget_set_hexpand(hb3, TRUE);
 
   // icon
-  btn = dtgtk_button_new(_buttons_get_icon_fct(gr->icon), 0, NULL);
+  btn = dtgtk_button_new_full(_buttons_get_icon_fct(gr->icon), 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("group icon"),
+        .clicked_cb = G_CALLBACK(_manage_editor_group_icon_popup),
+        .clicked_data = self,
+      });
   gtk_widget_set_name(btn, "modulegroups-group-icon");
-  gtk_widget_set_tooltip_text(btn, _("group icon"));
   gtk_widget_set_sensitive(btn, !d->edit_ro);
-  g_signal_connect(G_OBJECT(btn), "clicked",
-                   G_CALLBACK(_manage_editor_group_icon_popup), self);
   g_object_set_data(G_OBJECT(btn), "group", gr);
   gtk_box_pack_start(GTK_BOX(hb3), btn, FALSE, TRUE, 0);
 
@@ -3484,11 +3800,13 @@ static GtkWidget *_manage_editor_group_init_modules_box(dt_lib_module_t *self,
   // remove button
   if(!d->edit_ro)
   {
-    btn = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
-    gtk_widget_set_tooltip_text(btn, _("remove group"));
+    btn = dtgtk_button_new_full(dtgtk_cairo_paint_remove, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("remove group"),
+        .clicked_cb = G_CALLBACK(_manage_editor_group_remove),
+        .clicked_data = self,
+      });
     g_object_set_data(G_OBJECT(btn), "group", gr);
-    g_signal_connect(G_OBJECT(btn), "clicked",
-                     G_CALLBACK(_manage_editor_group_remove), self);
     gtk_box_pack_end(GTK_BOX(hb3), btn, FALSE, TRUE, 0);
   }
 
@@ -3511,34 +3829,39 @@ static GtkWidget *_manage_editor_group_init_modules_box(dt_lib_module_t *self,
     GtkWidget *hb4 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
     // left arrow
-    btn = dtgtk_button_new(dtgtk_cairo_paint_line_arrow, CPF_DIRECTION_RIGHT, NULL);
+    btn = dtgtk_button_new_full(dtgtk_cairo_paint_line_arrow, CPF_DIRECTION_RIGHT, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("move group to the left"),
+        .clicked_cb = G_CALLBACK(_manage_editor_group_move_left),
+        .clicked_data = self,
+      });
     gtk_widget_set_name(btn, "modulegroups-btn");
-    gtk_widget_set_tooltip_text(btn, _("move group to the left"));
     g_object_set_data(G_OBJECT(btn), "group", gr);
-    g_signal_connect(G_OBJECT(btn), "clicked",
-                     G_CALLBACK(_manage_editor_group_move_left), self);
     gtk_box_pack_start(GTK_BOX(hb4), btn, FALSE, FALSE, 2);
 
     // plus button
     GtkWidget *plusbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    GtkWidget *bt = dtgtk_button_new(dtgtk_cairo_paint_square_plus,
-                                     CPF_DIRECTION_LEFT, NULL);
-    gtk_widget_set_tooltip_text(bt, _("add module to the group"));
+    GtkWidget *bt = dtgtk_button_new_full(dtgtk_cairo_paint_square_plus, CPF_DIRECTION_LEFT, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("add module to the group"),
+        .clicked_cb = G_CALLBACK(_manage_editor_module_add_popup),
+        .clicked_data = self,
+      });
     gtk_widget_set_name(bt, "modulegroups-btn");
     g_object_set_data(G_OBJECT(bt), "group", gr);
-    g_signal_connect(G_OBJECT(bt), "clicked",
-                     G_CALLBACK(_manage_editor_module_add_popup), self);
     gtk_widget_set_halign(plusbox, GTK_ALIGN_CENTER);
     gtk_box_pack_start(GTK_BOX(plusbox), bt, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(hb4), plusbox, TRUE, TRUE, 0);
 
     //right arrow
-    btn = dtgtk_button_new(dtgtk_cairo_paint_line_arrow, CPF_DIRECTION_LEFT, NULL);
+    btn = dtgtk_button_new_full(dtgtk_cairo_paint_line_arrow, CPF_DIRECTION_LEFT, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("move group to the right"),
+        .clicked_cb = G_CALLBACK(_manage_editor_group_move_right),
+        .clicked_data = self,
+      });
     gtk_widget_set_name(btn, "modulegroups-btn");
-    gtk_widget_set_tooltip_text(btn, _("move group to the right"));
     g_object_set_data(G_OBJECT(btn), "group", gr);
-    g_signal_connect(G_OBJECT(btn), "clicked",
-                     G_CALLBACK(_manage_editor_group_move_right), self);
     gtk_box_pack_end(GTK_BOX(hb4), btn, FALSE, FALSE, 2);
 
     gtk_box_pack_start(GTK_BOX(vb2), hb4, FALSE, FALSE, 0);
@@ -3563,7 +3886,7 @@ static void _manage_editor_group_add(GtkWidget *widget,
                                      dt_lib_module_t *self)
 {
   dt_lib_modulegroups_t *d = self->data;
-  dt_lib_modulegroups_group_t *gr = g_malloc0(sizeof(dt_lib_modulegroups_group_t));
+  dt_lib_modulegroups_group_t *gr = g_try_malloc0(sizeof(dt_lib_modulegroups_group_t));
   if(gr)
   {
     gr->name = g_strdup(_("new"));
@@ -4124,9 +4447,11 @@ static void _manage_show_window(dt_lib_module_t *self)
   d->edit_autoapply_chkbox = gtk_check_button_new_with_label(_("auto-apply this preset"));
   gtk_widget_set_sensitive(d->edit_autoapply_chkbox, FALSE); // always readonly. change are done with the button...
   gtk_box_pack_start(GTK_BOX(hb2), d->edit_autoapply_chkbox, FALSE, TRUE, 0);
-  d->edit_autoapply_btn = dtgtk_button_new(dtgtk_cairo_paint_preferences, 0, NULL);
-  g_signal_connect(G_OBJECT(d->edit_autoapply_btn), "clicked",
-                   G_CALLBACK(_preset_autoapply_edit), self);
+  d->edit_autoapply_btn = dtgtk_button_new_full(dtgtk_cairo_paint_preferences, 0, NULL,
+      &(dtgtk_button_config_t){
+        .clicked_cb = G_CALLBACK(_preset_autoapply_edit),
+        .clicked_data = self,
+      });
   gtk_widget_set_name(d->edit_autoapply_btn, "modulegroups-autoapply-btn");
   gtk_box_pack_start(GTK_BOX(hb2), d->edit_autoapply_btn, FALSE, FALSE, 2);
   gtk_box_pack_start(GTK_BOX(vb), hb2, FALSE, TRUE, 0);
@@ -4138,11 +4463,11 @@ static void _manage_show_window(dt_lib_module_t *self)
   hb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_set_name(hb, "modulegroups-groups-title");
   gtk_box_pack_start(GTK_BOX(hb), gtk_label_new(_("module groups")), FALSE, TRUE, 0);
-  d->preset_btn_add_group = dtgtk_button_new(dtgtk_cairo_paint_square_plus,
-                                             CPF_DIRECTION_LEFT, NULL);
-  g_signal_connect(G_OBJECT(d->preset_btn_add_group), "clicked",
-                   G_CALLBACK(_manage_editor_group_add),
-                   self);
+  d->preset_btn_add_group = dtgtk_button_new_full(dtgtk_cairo_paint_square_plus, CPF_DIRECTION_LEFT, NULL,
+      &(dtgtk_button_config_t){
+        .clicked_cb = G_CALLBACK(_manage_editor_group_add),
+        .clicked_data = self,
+      });
   gtk_box_pack_start(GTK_BOX(hb), d->preset_btn_add_group, FALSE, FALSE, 0);
   gtk_widget_set_halign(hb, GTK_ALIGN_CENTER);
   gtk_box_pack_start(GTK_BOX(vb_main), hb, FALSE, TRUE, 0);
@@ -4235,6 +4560,7 @@ gboolean preset_autoapply(dt_lib_module_t *self)
 }
 
 #undef PADDING
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

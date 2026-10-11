@@ -18,6 +18,7 @@
 
 #include "common/colorspaces_inline_conversions.h"
 #include "common/colorspaces.h"
+#include "common/hdr-transfer.h"
 #include "common/colormatrices.c"
 #include "common/darktable.h"
 #include "common/debug.h"
@@ -825,11 +826,19 @@ const dt_colorspaces_color_profile_t *dt_colorspaces_get_work_profile
     {
       // use introspection to get the profile name from the binary params blob
       const void *params = sqlite3_column_blob(stmt, 0);
+      const size_t params_size = sqlite3_column_bytes(stmt, 0);
       dt_colorspaces_color_profile_type_t *type = colorin->get_p(params, "type_work");
       char *filename = colorin->get_p(params, "filename_work");
+      const dt_introspection_field_t *f = colorin->get_f("filename_work");
 
-      if(type && filename) p = dt_colorspaces_get_profile(*type, filename,
-                                                          DT_PROFILE_DIRECTION_WORK);
+      // the blob comes from sidecars or the database unchecked: it may end
+      // before the file name, or not terminate it. type_work precedes the
+      // file name, so the same check keeps *type inside the blob
+      if(type && filename && f
+         && dt_util_blob_has_fixed_string(params, params_size,
+                                          f->header.offset, f->header.size))
+        p = dt_colorspaces_get_profile(*type, filename,
+                                       DT_PROFILE_DIRECTION_WORK);
     }
     sqlite3_finalize(stmt);
   }
@@ -892,10 +901,17 @@ const dt_colorspaces_color_profile_t *dt_colorspaces_get_output_profile
     {
       // use introspection to get the profile name from the binary params blob
       const void *params = sqlite3_column_blob(stmt, 0);
+      const size_t params_size = sqlite3_column_bytes(stmt, 0);
       dt_colorspaces_color_profile_type_t *type = colorout->get_p(params, "type");
       char *filename = colorout->get_p(params, "filename");
+      const dt_introspection_field_t *f = colorout->get_f("filename");
 
-      if(type && filename)
+      // the blob comes from sidecars or the database unchecked: it may end
+      // before the file name, or not terminate it. type precedes the file
+      // name, so the same check keeps *type inside the blob
+      if(type && filename && f
+         && dt_util_blob_has_fixed_string(params, params_size,
+                                          f->header.offset, f->header.size))
         p = dt_colorspaces_get_profile
           (*type, filename,
            DT_PROFILE_DIRECTION_OUT | DT_PROFILE_DIRECTION_DISPLAY);
@@ -932,7 +948,7 @@ static void dt_colorspaces_create_cmatrix(float cmatrix[4][3], float mat[3][3])
 }
 #endif
 
-static cmsHPROFILE dt_colorspaces_create_xyzmatrix_profile(const float mat[3][3])
+cmsHPROFILE dt_colorspaces_create_xyzmatrix_profile(const float mat[3][3])
 {
   // mat: cam -> xyz
   dt_aligned_pixel_t x, y;
@@ -1048,6 +1064,24 @@ void dt_colorspaces_cleanup_profile(cmsHPROFILE p)
 {
   if(!p) return;
   cmsCloseProfile(p);
+}
+
+cmsHPROFILE dt_colorspaces_linearize_profile(cmsHPROFILE profile)
+{
+  cmsHPROFILE linear = dt_colorspaces_make_temporary_profile(profile);
+  if(!linear) return NULL;
+  cmsToneCurve *trc = cmsBuildGamma(NULL, 1.0);
+  const gboolean valid = trc
+    && cmsWriteTag(linear, cmsSigRedTRCTag, trc)
+    && cmsWriteTag(linear, cmsSigGreenTRCTag, trc)
+    && cmsWriteTag(linear, cmsSigBlueTRCTag, trc);
+  cmsFreeToneCurve(trc);
+  if(!valid)
+  {
+    cmsCloseProfile(linear);
+    return NULL;
+  }
+  return linear;
 }
 
 cmsHPROFILE dt_colorspaces_make_temporary_profile(cmsHPROFILE profile)
@@ -1819,6 +1853,10 @@ const char *dt_colorspaces_get_name(dt_colorspaces_color_profile_type_t type,
        return _("HLG P3");
      case DT_COLORSPACE_DISPLAY_P3:
        return _("Display P3");
+     case DT_COLORSPACE_FORWARD_MATRIX:
+       return _("DNG forward matrix");
+     case DT_COLORSPACE_DNG_LOOK:
+       return _("DNG embedded look");
      case DT_COLORSPACE_LAST:
        break;
   }
@@ -2049,7 +2087,13 @@ void dt_colorspaces_set_display_profile
   GtkWidget *widget = (profile_type == DT_COLORSPACE_DISPLAY2)
       ? darktable.develop->second_wnd
       : dt_ui_center(darktable.gui->ui);
-  GdkWindow *window = gtk_widget_get_window(widget);
+  // use the toplevel's window, which is already native. Calling
+  // gdk_win32_window_get_handle() on the center widget's client-side window
+  // makes GDK turn it into a native child window, which GDK then raises with
+  // SetForegroundWindow() whenever the center overlay is re-allocated
+  // (thumbnail hover, toasts, log messages), stealing the focus from other
+  // applications (#20442).
+  GdkWindow *window = gtk_widget_get_window(gtk_widget_get_toplevel(widget));
   HWND hwnd = (HWND)gdk_win32_window_get_handle(window);  // get window handle
   HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST); // get monitor handle
   if(!hMonitor)
@@ -2612,6 +2656,7 @@ gboolean dt_colorspaces_profile_is_wide_gamut(const dt_colorspaces_color_profile
     case DT_COLORSPACE_PQ_P3:
     case DT_COLORSPACE_HLG_P3:
     case DT_COLORSPACE_DISPLAY_P3:
+    case DT_COLORSPACE_FORWARD_MATRIX:
       return TRUE;
 
     // sRGB primaries (gamma may differ but gamut is the same)
@@ -2630,6 +2675,7 @@ gboolean dt_colorspaces_profile_is_wide_gamut(const dt_colorspaces_color_profile
     case DT_COLORSPACE_DISPLAY2:
     case DT_COLORSPACE_EMBEDDED_ICC:
     case DT_COLORSPACE_EMBEDDED_MATRIX:
+    case DT_COLORSPACE_DNG_LOOK:
     case DT_COLORSPACE_STANDARD_MATRIX:
     case DT_COLORSPACE_ENHANCED_MATRIX:
     case DT_COLORSPACE_VENDOR_MATRIX:

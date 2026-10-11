@@ -15,24 +15,25 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
-#include "common/gdk_event_utils.h"
 
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
 #include "common/debug.h"
-#include "common/file_location.h"
 #include "common/presets.h"
 #include "develop/blend.h"
 #include "develop/develop.h"
+#include "develop/imageop.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "gui/guides.h"
 #include "gui/presets.h"
-#include "libs/modulegroups.h"
+#include <glib-2.0/gio/gio.h>
+#include <glib-2.0/gio/gmenu.h>
+
 #ifdef GDK_WINDOWING_QUARTZ
 #include "osx/osx.h"
 #endif
-#include <assert.h>
+
 #include <stdlib.h>
 
 #define MAX_FOCAL_LEN 100000
@@ -142,9 +143,12 @@ void dt_gui_presets_add_with_blendop(const char *name,
   sqlite3_finalize(stmt);
 }
 
-static void _menuitem_delete_preset(GtkMenuItem *menuitem,
-                                    dt_iop_module_t *module)
+static void _menuitem_delete_preset(GSimpleAction *action,
+                                    GVariant *parameter,
+                                    gpointer user_data)
 {
+  dt_iop_module_t *module = (dt_iop_module_t *)user_data;
+
   gboolean writeprotect = FALSE;
   gchar *name = dt_get_active_preset_name(module, &writeprotect);
   if(name == NULL) return;
@@ -991,14 +995,22 @@ static void _edit_preset(const char *name_in, dt_iop_module_t *module)
   g_free(name);
 }
 
-static void _menuitem_edit_preset(GtkMenuItem *menuitem, dt_iop_module_t *module)
+static void _menuitem_edit_preset(GSimpleAction *action,
+                                  GVariant *parameter,
+                                  gpointer user_data)
 {
+  dt_iop_module_t *module = (dt_iop_module_t *)user_data;
+
   _edit_preset(NULL, module);
 }
 
-static void _menuitem_update_preset(GtkMenuItem *menuitem, dt_iop_module_t *module)
+static void _menuitem_update_preset(GSimpleAction *action,
+                                    GVariant *parameter,
+                                    gpointer user_data)
 {
-  gchar *name = g_object_get_data(G_OBJECT(menuitem), "dt-preset-name");
+  dt_iop_module_t *module = (dt_iop_module_t *)user_data;
+
+  const gchar *name = g_variant_get_string(parameter,  NULL);
 
   if(!dt_conf_get_bool("plugins/lighttable/preset/ask_before_delete_preset")
      || dt_gui_show_yes_no_dialog(_("update preset?"), "",
@@ -1029,9 +1041,13 @@ static void _menuitem_update_preset(GtkMenuItem *menuitem, dt_iop_module_t *modu
   }
 }
 
-static void _menuitem_new_preset(GtkMenuItem *menuitem,
-                                 dt_iop_module_t *module)
+static void _menuitem_new_preset(GSimpleAction *action,
+                                 GVariant *parameter,
+                                 gpointer user_data)
 {
+
+  dt_iop_module_t *module = (dt_iop_module_t *)user_data;
+
   // add new preset
   dt_lib_presets_remove(_("new preset"), module->op, module->version());
 
@@ -1089,7 +1105,7 @@ void dt_gui_presets_apply_preset(const gchar* name,
        && (blendop_version == dt_develop_blend_version())
        && (bl_length == sizeof(dt_develop_blend_params_t)))
     {
-      dt_iop_commit_blend_params(module, blendop_params);
+      dt_iop_commit_blend_params(module, blendop_params, NULL);
     }
     else if(blendop_params
             && dt_develop_blend_legacy_params(module, blendop_params,
@@ -1100,7 +1116,7 @@ void dt_gui_presets_apply_preset(const gchar* name,
     }
     else
     {
-      dt_iop_commit_blend_params(module, module->default_blendop_params);
+      dt_iop_commit_blend_params(module, module->default_blendop_params, NULL);
     }
 
     DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_PRESET_APPLIED, module);
@@ -1112,6 +1128,11 @@ void dt_gui_presets_apply_preset(const gchar* name,
 
   sqlite3_finalize(stmt);
   dt_iop_gui_update(module);
+  // dt_iop_gui_update() runs inside the GUI-update guard, so module GUI
+  // callbacks cannot refresh the pixelpipes there.  Apply the preset's
+  // parameter changes after leaving that guard; tone equalizer needs this
+  // synchronization to rebuild its luminance cache and histogram.
+  dt_iop_refresh_all(module);
   dt_dev_add_history_item(darktable.develop, module, FALSE);
   gtk_widget_queue_draw(module->widget);
 
@@ -1258,93 +1279,41 @@ gboolean dt_gui_presets_autoapply_for_module(dt_iop_module_t *module, GtkWidget 
   return found;
 }
 
-static guint _click_time = G_MAXUINT;
-
-static gboolean _menuitem_motion_preset(GtkMenuItem *menuitem,
-                                        GdkEventMotion *event,
-                                        dt_iop_module_t *module)
-{
-  if(!_click_time) _click_time = G_MAXUINT;
-
-  return FALSE;
-}
-
-static gpointer _active_menu_item = NULL;
-
-static gboolean _menuitem_button_preset(GtkMenuItem *menuitem,
-                                        GdkEventButton *event,
-                                        dt_iop_module_t *module)
-{
-  gboolean long_click = dt_gui_long_click(dt_gdk_event_get_time(event), _click_time);
-
-  gchar *name = g_object_get_data(G_OBJECT(menuitem), "dt-preset-name");
-
-  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
-  {
-    if(_click_time > dt_gdk_event_get_time(event))
-    {
-      if(_active_menu_item)
-        gtk_check_menu_item_set_active(_active_menu_item, FALSE);
-      gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(menuitem), TRUE);
-      g_set_weak_pointer(&_active_menu_item, menuitem);
-
-      dt_gui_presets_apply_preset(name, module);
-    }
-  }
-  else if(dt_gdk_event_get_button(event) == GDK_BUTTON_SECONDARY
-          && dt_gdk_event_get_type(event) == GDK_BUTTON_RELEASE
-          && _click_time)
-  {
-    if(long_click || (module->flags() & IOP_FLAGS_ONE_INSTANCE))
-      dt_shortcut_copy_lua((dt_action_t*)module, name);
-    else
-    {
-      dt_iop_module_t *new_module = dt_iop_gui_duplicate(module, FALSE);
-      if(new_module) dt_gui_presets_apply_preset(name, new_module);
-
-      if(dt_conf_get_bool("darkroom/ui/rename_new_instance"))
-        dt_iop_gui_rename_module(new_module);
-    }
-  }
-
-  if(dt_conf_get_bool("accel/prefer_enabled")
-     || dt_conf_get_bool("accel/prefer_unmasked"))
-  {
-    // rebuild the accelerators
-    dt_iop_connect_accels_multi(module->so);
-  }
-
-  _click_time = dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS ? dt_gdk_event_get_time(event) : G_MAXUINT;
-  return long_click; // keep menu open on long click
-}
-
 // need to catch "activate" signal as well to handle keyboard
-static void _menuitem_activate_preset(GtkMenuItem *menuitem,
-                                      dt_iop_module_t *module)
+static void _menuitem_activate_preset(GSimpleAction *action,
+                                      GVariant *parameter,
+                                      gpointer user_data)
 {
-  GdkEvent *event = gtk_get_current_event();
-  if(dt_gdk_event_get_type(event) == GDK_KEY_PRESS)
-    dt_gui_presets_apply_preset(g_object_get_data(G_OBJECT(menuitem),
-                                                  "dt-preset-name"), module);
-  gdk_event_free(event);
+  dt_iop_module_t *module = (dt_iop_module_t *)user_data;
+
+  const gchar *preset_name = g_variant_get_string(parameter,  NULL);
+  dt_gui_presets_apply_preset(preset_name, module);
+
+  // if(dt_gui_menuitem_activated_by_keyboard(GTK_WIDGET(menuitem)))
+  //   dt_gui_presets_apply_preset(g_object_get_data(G_OBJECT(menuitem),
+  //                                                 "dt-preset-name"), module);
+
+  // close the menu
+  gtk_popover_popdown(GTK_POPOVER(darktable.gui->active_popover_menu));
 }
 
-static void _menuitem_connect_preset(GtkWidget *mi,
-                                     const gchar *name,
-                                     dt_iop_module_t *iop)
+static void _menuitem_activate_quick_preset(GSimpleAction *action,
+                                            GVariant *parameter,
+                                            gpointer user_data)
 {
-  g_object_set_data_full(G_OBJECT(mi), "dt-preset-name", g_strdup(name), g_free);
-  g_object_set_data(G_OBJECT(mi), "dt-preset-module", iop);
-  dt_action_define(&iop->so->actions, "preset", name, mi, NULL);
-  g_signal_connect(G_OBJECT(mi), "activate",
-                   G_CALLBACK(_menuitem_activate_preset), iop);
-  g_signal_connect(G_OBJECT(mi), "button-press-event",
-                   G_CALLBACK(_menuitem_button_preset), iop);
-  g_signal_connect(G_OBJECT(mi), "button-release-event",
-                   G_CALLBACK(_menuitem_button_preset), iop);
-  g_signal_connect(G_OBJECT(mi), "motion-notify-event",
-                   G_CALLBACK(_menuitem_motion_preset), iop);
-  gtk_widget_set_has_tooltip(mi, TRUE);
+  GVariant *v_name = g_variant_get_child_value(parameter, 0);
+  GVariant *v_ptr  = g_variant_get_child_value(parameter, 1);
+
+  const gchar *preset_name = g_variant_get_string(v_name, NULL);
+  guint64 ptr_val          = g_variant_get_uint64(v_ptr);
+
+  g_variant_unref(v_name);
+  g_variant_unref(v_ptr);
+
+  g_variant_get(parameter, "(&st)", &preset_name, &ptr_val);
+  dt_iop_module_t *module = (dt_iop_module_t *)ptr_val;
+
+  dt_gui_presets_apply_preset(preset_name, module);
 }
 
 /* quick presets list
@@ -1417,8 +1386,9 @@ static int _menuitem_manage_quick_presets_sort(gconstpointer a, gconstpointer b)
   return res;
 }
 
-static void _menuitem_manage_quick_presets(GtkMenuItem *menuitem,
-                                           gpointer data)
+static void _menuitem_manage_quick_presets(GSimpleAction *action,
+                                           GVariant *parameter, 
+                                           gpointer user_data)
 {
   sqlite3_stmt *stmt;
   GtkWindow *win = GTK_WINDOW(dt_ui_main_window(darktable.gui->ui));
@@ -1533,10 +1503,29 @@ static void _menuitem_manage_quick_presets(GtkMenuItem *menuitem,
   gtk_widget_show_all(dialog);
 }
 
-void dt_gui_favorite_presets_menu_show(GtkWidget *w)
+void dt_gui_favorite_presets_menu_show(GtkWidget *favorite_presets_button)
 {
+  GActionGroup *action_group = gtk_widget_get_action_group(favorite_presets_button, "favorites");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "activate", _menuitem_activate_quick_preset, "(st)", NULL },
+      { "manage",   _menuitem_manage_quick_presets,  NULL,   NULL }
+    };
+
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    NULL);
+    gtk_widget_insert_action_group(favorite_presets_button, 
+                                   "favorites",
+                                   G_ACTION_GROUP(action_group));
+  }
+
   sqlite3_stmt *stmt;
-  GtkMenu *menu = GTK_MENU(gtk_menu_new());
+  GMenu *menu = g_menu_new();
 
   const gboolean default_first =
     dt_conf_get_bool("plugins/darkroom/default_presets_first");
@@ -1589,18 +1578,20 @@ void dt_gui_favorite_presets_menu_show(GtkWidget *w)
         gchar *txt = g_strdup_printf("ꬹ%s|%sꬹ", iop->so->op, name);
         if(config && strstr(config, txt))
         {
-          GtkWidget *mi = gtk_menu_item_new_with_label("");
           gchar *local_name =
             write_protect
             ? dt_util_localize_segmented_name(name, TRUE)
             : g_strdup(name);
-          gchar *tt = g_markup_printf_escaped("<b>%s %s</b> %s",
+          gchar *tt = g_markup_printf_escaped("%s %s %s",
                                               iop->name(), iop->multi_name, local_name);
-          gtk_label_set_markup(GTK_LABEL(gtk_bin_get_child(GTK_BIN(mi))), tt);
+          GMenuItem *mi = g_menu_item_new(tt, NULL);
+          g_menu_item_set_action_and_target_value(mi,
+                                                  "favorites.activate",
+                                                  g_variant_new("(st)", name, (guintptr)iop));
+          g_menu_append_item(menu, mi);
+          g_object_unref(mi);
           g_free(tt);
           g_free(local_name);
-          _menuitem_connect_preset(mi, name, iop);
-          gtk_menu_shell_append(GTK_MENU_SHELL(menu), GTK_WIDGET(mi));
         }
         g_free(txt);
       }
@@ -1612,40 +1603,211 @@ void dt_gui_favorite_presets_menu_show(GtkWidget *w)
   g_free(config);
   g_free(query);
 
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-  GtkMenuItem *smi_manage = (GtkMenuItem *)gtk_menu_item_new_with_label
-    (_("manage quick presets list..."));
-  g_signal_connect(G_OBJECT(smi_manage), "activate",
-                   G_CALLBACK(_menuitem_manage_quick_presets), NULL);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), GTK_WIDGET(smi_manage));
+  GMenu *submenu = g_menu_new();
+  g_menu_append_section(menu, NULL, G_MENU_MODEL(submenu));
+  g_menu_append(submenu, _("manage quick presets list..."), "favorites.manage");
 
-  dt_gui_menu_popup(menu, w, GDK_GRAVITY_SOUTH_WEST, GDK_GRAVITY_NORTH_WEST);
+  // popup the menu
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(GTK_WIDGET(favorite_presets_button), menu);
+  g_object_unref(submenu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
 }
 
-GtkMenu *dt_gui_presets_popup_menu_show_for_module(dt_iop_module_t *module)
+/* shared preset popup menu: the query walk, writeprotect separators,
+ * hierarchy insertion, active highlight and the manage/edit/delete/
+ * store/update/prefs tail are identical for the darkroom iop and lib
+ * (modulegroups / header) presets menus.  Everything that differs -- the
+ * SQL, the row evaluation, the per-item wiring and the trailing prefs
+ * section -- is supplied by ops. */
+GtkWidget *dt_gui_presets_popup_menu_show(GtkWidget *button,
+                                          const dt_gui_presets_menu_ops_t *ops)
 {
-  const int32_t version = module->version();
-  dt_iop_params_t *params = module->params;
-  const int32_t params_size = module->params_size;
-  dt_develop_blend_params_t *bl_params = module->blend_params;
-  const dt_image_t *image = &module->dev->image_storage;
+  GActionGroup *action_group = gtk_widget_get_action_group(button, "presets");
+  if(action_group == NULL)
+  {
+    GActionEntry action_entries[] =
+    {
+      { "activate", ops->activate_cb, "s",  "''" },
+      { "edit",     ops->edit_cb,     NULL, NULL },
+      { "delete",   ops->del_cb,      NULL, NULL },
+      { "new",      ops->store_cb,    NULL, NULL },
+      { "update",   ops->update_cb,   "s",  NULL },
+      { "manage",   ops->manage_cb,   NULL, NULL }
+    };
 
-  GtkMenu *menu = GTK_MENU(gtk_menu_new());
-  const gboolean hide_default = dt_conf_get_bool("plugins/darkroom/hide_default_presets");
+    action_group = G_ACTION_GROUP(g_simple_action_group_new());
+    g_action_map_add_action_entries(G_ACTION_MAP(action_group),
+                                    action_entries,
+                                    G_N_ELEMENTS(action_entries),
+                                    ops->data);
+    gtk_widget_insert_action_group(button, 
+                                   "presets",
+                                   G_ACTION_GROUP(action_group));
+  }
+
+  GMenu *menu = g_menu_new();
+
+  const gboolean hide_default = dt_conf_get_bool(ops->hide_defaults_pref);
+
+  gchar *query = ops->query(ops->data);
+  sqlite3_stmt *stmt;
+  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db), query, -1, &stmt, NULL);
+  g_free(query);
+  ops->bind(stmt, ops->data);
+
+  int cnt = 0;
+  gchar *active_preset_name = NULL;
+  gboolean selected_writeprotect = FALSE;
+  gboolean found = FALSE;
+  int last_wp = -1;
+  gchar **prev_split = NULL;
+  GMenu *submenu = menu;
+  GMenu *mainmenu = submenu;
+  GSList *menu_path = NULL; // stack of menuitems which are the parents of submenus on menu_stack
+  GAction *item_action;
+
+  while(sqlite3_step(stmt) == SQLITE_ROW)
+  {
+    // default vs built-in stuff
+    const gboolean writeprotect = sqlite3_column_int(stmt, 2);
+    if(hide_default && writeprotect)
+    {
+      // skip default module if set to hide them.
+      continue;
+    }
+    if(last_wp == -1)
+    {
+      last_wp = writeprotect;
+    }
+    else if(last_wp != writeprotect)
+    {
+      last_wp = writeprotect;
+      submenu = mainmenu = g_menu_new();
+      g_menu_append_section(menu, NULL, G_MENU_MODEL(submenu));
+
+      *prev_split[0] = '\0'; // make first level mismatch so we start over
+    }
+
+    const char *name = (const char *)sqlite3_column_text(stmt, 0);
+
+    if(darktable.gui->last_preset && strcmp(darktable.gui->last_preset, name) == 0)
+      found = TRUE;
+
+    gchar *action = g_strdup_printf("presets.activate::%s", name);
+    dt_insert_preset_in_menu_hierarchy(name,
+                                       action,
+                                       &menu_path,
+                                       mainmenu,
+                                       &submenu,
+                                       &prev_split,
+                                       ops->is_default
+                                         ? ops->is_default(stmt, ops->data)
+                                         : FALSE,
+                                       writeprotect);
+    g_free(action);
+
+    gboolean wp = FALSE;
+    if(ops->is_active(stmt, ops->data, &wp))
+    {
+      active_preset_name = g_strdup(name);
+      selected_writeprotect = wp;
+    }
+
+    item_action = g_action_map_lookup_action(G_ACTION_MAP(action_group), "activate");
+
+    if(ops->is_disabled && ops->is_disabled(stmt, ops->data))
+    {
+      g_simple_action_set_enabled(G_SIMPLE_ACTION(item_action), FALSE);
+    }
+    else
+    {
+      g_simple_action_set_enabled(G_SIMPLE_ACTION(item_action), TRUE);
+    }
+
+    cnt++;
+  }
+  sqlite3_finalize(stmt);
+  g_slist_free(menu_path);
+  g_strfreev(prev_split);
+
+  if(cnt > 0)
+  {
+    mainmenu = g_menu_new();
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(mainmenu));
+  }
+
+  // tail: manage / edit+delete / store+update, then the optional prefs section
+  if(ops->manage_cb)
+    g_menu_append(mainmenu, _("manage presets..."), "presets.manage");
+  else if(active_preset_name && !selected_writeprotect)
+  {
+    g_menu_append(mainmenu, _("edit this preset..."), "presets.edit");
+    g_menu_append(mainmenu, _("delete this preset"), "presets.delete");
+  }
+  else
+  {
+    /* no active preset, or the active preset is writeprotect (a shipped
+     * default): edit/delete are not allowed, so fall through to store/
+     * update instead of leaving a bare separator behind the preset list. */
+    g_menu_append(mainmenu, _("store new preset..."), "presets.new");
+
+    if(darktable.gui->last_preset && found)
+    {
+      char *local_last_name = dt_util_localize_segmented_name(darktable.gui->last_preset,
+                                                              TRUE);
+      gchar *markup = g_markup_printf_escaped("%s %s",
+                                              _("update preset"),
+                                              local_last_name);
+      
+      gchar *action = g_strdup_printf("presets.update::%s", local_last_name);  
+      g_menu_append(mainmenu, markup, action);
+      g_free(action);
+
+      g_free(local_last_name);
+      g_free(markup);
+    }
+  }
+
+  if(ops->prefs)
+  {
+    mainmenu = g_menu_new();
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(mainmenu));
+    ops->prefs(mainmenu, ops->data);
+  }
+
+  // mark the active preset
+  item_action = g_action_map_lookup_action(G_ACTION_MAP(action_group), "activate");
+  g_simple_action_set_state(G_SIMPLE_ACTION(item_action),
+                            g_variant_new_string(active_preset_name? active_preset_name : ""));
+
+  g_free(active_preset_name);
+  active_preset_name = NULL;
+
+  // popup the menu
+  GtkWidget *popover_menu = dt_gui_popover_menu_from_model(button, menu);
+  g_object_unref(menu);
+  gtk_popover_popup(GTK_POPOVER(popover_menu));
+
+  return popover_menu;
+}
+
+
+
+/* ---------- darkroom iop preset menu ---------- */
+
+static gchar *_iop_query(gpointer data)
+{
+  dt_iop_module_t *module = data;
+  const dt_image_t *image = &module->dev->image_storage;
   const gboolean default_first = dt_conf_get_bool("modules/default_presets_first");
 
-  gchar *query = NULL;
-
-  GtkWidget *mi;
-  int active_preset = -1, cnt = 0, writeprotect = 0; //, selected_default = 0;
-  sqlite3_stmt *stmt;
-  // order: get shipped defaults first
   if(image)
   {
     char *format_filter = dt_presets_get_filter(image);
 
     // clang-format off
-    query = g_strdup_printf
+    gchar *query = g_strdup_printf
       ("SELECT name, op_params, writeprotect, description, blendop_params, "
        "  op_version, enabled"
        " FROM data.presets"
@@ -1665,9 +1827,28 @@ GtkMenu *dt_gui_presets_popup_menu_show_for_module(dt_iop_module_t *module)
     // clang-format on
 
     g_free(format_filter);
+    return query;
+  }
 
-    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db), query, -1, &stmt, NULL);
-    DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, module->op, -1, SQLITE_TRANSIENT);
+  // don't know for which image. show all we got:
+  // clang-format off
+  return g_strdup_printf("SELECT name, op_params, writeprotect, "
+                         "       description, blendop_params, op_version, enabled"
+                         " FROM data.presets"
+                         " WHERE operation=?1"
+                         " ORDER BY writeprotect %s, LOWER(name), rowid",
+                         default_first ? "DESC":"ASC");
+  // clang-format on
+}
+
+static void _iop_bind(sqlite3_stmt *stmt, gpointer data)
+{
+  dt_iop_module_t *module = data;
+  const dt_image_t *image = &module->dev->image_storage;
+
+  DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, module->op, -1, SQLITE_TRANSIENT);
+  if(image)
+  {
     DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 2, image->exif_model, -1, SQLITE_TRANSIENT);
     DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 3, image->exif_maker, -1, SQLITE_TRANSIENT);
     DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 4, image->camera_alias, -1, SQLITE_TRANSIENT);
@@ -1678,169 +1859,89 @@ GtkMenu *dt_gui_presets_popup_menu_show_for_module(dt_iop_module_t *module)
     DT_DEBUG_SQLITE3_BIND_DOUBLE(stmt, 9, image->exif_aperture);
     DT_DEBUG_SQLITE3_BIND_DOUBLE(stmt, 10, image->exif_focal_length);
   }
-  else
+}
+
+static gboolean _iop_is_default(sqlite3_stmt *stmt, gpointer data)
+{
+  dt_iop_module_t *module = data;
+  const void *op_params = sqlite3_column_blob(stmt, 1);
+  const int32_t op_params_size = sqlite3_column_bytes(stmt, 1);
+  const void *blendop_params = sqlite3_column_blob(stmt, 4);
+  const int32_t bl_params_size = sqlite3_column_bytes(stmt, 4);
+
+  return module
+    && (op_params_size == 0
+        || !memcmp(module->default_params, op_params,
+                   MIN(op_params_size, module->params_size)))
+    && !memcmp(module->default_blendop_params, blendop_params,
+               MIN(bl_params_size, sizeof(dt_develop_blend_params_t)));
+}
+
+static gboolean _iop_is_disabled(sqlite3_stmt *stmt, gpointer data)
+{
+  dt_iop_module_t *module = data;
+  return sqlite3_column_int(stmt, 5) != module->version();
+}
+
+static gboolean _iop_is_active(sqlite3_stmt *stmt, gpointer data, gboolean *writeprotect)
+{
+  dt_iop_module_t *module = data;
+  const void *op_params = sqlite3_column_blob(stmt, 1);
+  const int32_t op_params_size = sqlite3_column_bytes(stmt, 1);
+  const void *blendop_params = sqlite3_column_blob(stmt, 4);
+  const int32_t bl_params_size = sqlite3_column_bytes(stmt, 4);
+  const int32_t enabled = sqlite3_column_int(stmt, 6);
+
+  if(((op_params_size == 0
+       && !memcmp(module->params, module->default_params,
+                  MIN(module->params_size, module->params_size)))
+      || (op_params_size > 0
+          && !memcmp(module->params, op_params, MIN(op_params_size, module->params_size))))
+     && !memcmp(module->blend_params, blendop_params,
+                MIN(bl_params_size, sizeof(dt_develop_blend_params_t)))
+     && (module->enabled && enabled))
   {
-    // don't know for which image. show all we got:
-
-    query = g_strdup_printf("SELECT name, op_params, writeprotect, "
-                            "       description, blendop_params, op_version, enabled"
-                            " FROM data.presets"
-                            " WHERE operation=?1"
-                            " ORDER BY writeprotect %s, LOWER(name), rowid",
-                            default_first ? "DESC":"ASC"
-                           );
-
-    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db), query, -1, &stmt, NULL);
-    DT_DEBUG_SQLITE3_BIND_TEXT(stmt, 1, module->op, -1, SQLITE_TRANSIENT);
+    *writeprotect = sqlite3_column_int(stmt, 2);
+    return TRUE;
   }
-  g_free(query);
-  // collect all presets for op from db
-  gboolean found = FALSE;
-  int last_wp = -1;
-  gchar **prev_split = NULL;
-  GtkWidget *submenu = GTK_WIDGET(menu);
-  GtkWidget *mainmenu = submenu;
-  GSList *menu_path = NULL; // stack of menuitems which are the parents of submenus on menu_stack
-  while(sqlite3_step(stmt) == SQLITE_ROW)
-  {
-    const int chk_writeprotect = sqlite3_column_int(stmt, 2);
-    if(hide_default && chk_writeprotect)
-    {
-      //skip default module if set to hide them.
-      continue;
-    }
-    if(last_wp == -1)
-    {
-      last_wp = chk_writeprotect;
-    }
-    else if(last_wp != chk_writeprotect)
-    {
-      last_wp = chk_writeprotect;
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-      *prev_split[0] = '\0'; // make first level mismatch so we start over
-    }
-    const void *op_params = (void *)sqlite3_column_blob(stmt, 1);
-    const int32_t op_params_size = sqlite3_column_bytes(stmt, 1);
-    const void *blendop_params = (void *)sqlite3_column_blob(stmt, 4);
-    const int32_t bl_params_size = sqlite3_column_bytes(stmt, 4);
-    const int32_t preset_version = sqlite3_column_int(stmt, 5);
-    const int32_t enabled = sqlite3_column_int(stmt, 6);
-    const int32_t isdisabled = (preset_version == version ? 0 : 1);
-    const char *name = (char *)sqlite3_column_text(stmt, 0);
-    gboolean isdefault = FALSE;
+  return FALSE;
+}
 
-    if(darktable.gui->last_preset && strcmp(darktable.gui->last_preset, name) == 0)
-      found = TRUE;
+static void _iop_prefs(GMenu *menu, gpointer data)
+{
+  dt_iop_module_t *module = data;
 
-    if(module
-       && (op_params_size == 0
-           || !memcmp(module->default_params, op_params,
-                      MIN(op_params_size, module->params_size)))
-       && !memcmp(module->default_blendop_params, blendop_params,
-                  MIN(bl_params_size, sizeof(dt_develop_blend_params_t))))
-      isdefault = TRUE;
+  GActionGroup *action_group = gtk_widget_get_action_group(module->presets_button, "presets");
 
-    mi = dt_insert_preset_in_menu_hierarchy(name, &menu_path, mainmenu,
-                                            &submenu, &prev_split,
-                                            isdefault, chk_writeprotect);
+  // the guide checkbox
+  if(module->flags() & IOP_FLAGS_GUIDES_WIDGET)
+    dt_guides_add_module_menuitem(menu, action_group, module);
 
-    if(module
-       && ((op_params_size == 0
-            && !memcmp(params, module->default_params,
-                       MIN(params_size, module->params_size)))
-            || (op_params_size > 0
-                && !memcmp(params, op_params, MIN(op_params_size, params_size))))
-       && !memcmp(bl_params, blendop_params, MIN(bl_params_size,
-                                                 sizeof(dt_develop_blend_params_t)))
-       && (module->enabled && enabled)
-       )
-    {
-      active_preset = cnt;
-      writeprotect = sqlite3_column_int(stmt, 2);
-      dt_gui_add_class(mi, "active_menu_item");
-      gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi), TRUE);
-      g_set_weak_pointer(&_active_menu_item, mi);
-      // walk back up the menu hierarchy and highlight the entire path
-      // down to the current leaf.
-      for(const GSList *mp = menu_path; mp; mp = g_slist_next(mp))
-        dt_gui_add_class(gtk_bin_get_child(GTK_BIN(mp->data)), "active_menu_item");
-    }
+  // the specific parameters
+  if(module->set_preferences) module->set_preferences(menu, action_group, module);
+}
 
-    if(isdisabled)
-    {
-      gtk_widget_set_sensitive(mi, 0);
-      gtk_widget_set_tooltip_text(mi, _("disabled: wrong module version"));
-    }
-    else
-    {
-      gtk_widget_set_tooltip_text(mi, (const char *)sqlite3_column_text(stmt, 3));
-      _menuitem_connect_preset(mi, name, module);
-    }
-    cnt++;
-  }
-  sqlite3_finalize(stmt);
-  g_slist_free(menu_path);
-  g_strfreev(prev_split);
+void dt_gui_presets_popup_menu_show_for_module(GtkWidget *button, dt_iop_module_t *module)
+{
+  const dt_gui_presets_menu_ops_t ops = {
+    .data = module,
+    .hide_defaults_pref = "plugins/darkroom/hide_default_presets",
+    .query = _iop_query,
+    .bind = _iop_bind,
+    .is_default = _iop_is_default,
+    .is_disabled = _iop_is_disabled,
+    .is_active = _iop_is_active,
+    .params_size = module->params_size,
+    .activate_cb = _menuitem_activate_preset,
+    .edit_cb = _menuitem_edit_preset,
+    .del_cb = _menuitem_delete_preset,
+    .store_cb = _menuitem_new_preset,
+    .update_cb = _menuitem_update_preset,
+    .prefs = (module->set_preferences || module->flags() & IOP_FLAGS_GUIDES_WIDGET)
+               ? _iop_prefs : NULL,
+  };
 
-  if(cnt > 0) gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-
-  if(module)
-  {
-    if(active_preset >= 0 && !writeprotect)
-    {
-      mi = gtk_menu_item_new_with_label(_("edit this preset.."));
-      g_signal_connect(G_OBJECT(mi), "activate",
-                       G_CALLBACK(_menuitem_edit_preset), module);
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
-
-      mi = gtk_menu_item_new_with_label(_("delete this preset"));
-      g_signal_connect(G_OBJECT(mi), "activate",
-                       G_CALLBACK(_menuitem_delete_preset), module);
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
-    }
-    else
-    {
-      mi = gtk_menu_item_new_with_label(_("store new preset.."));
-      g_signal_connect(G_OBJECT(mi), "activate",
-                       G_CALLBACK(_menuitem_new_preset), module);
-      gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
-
-      if(darktable.gui->last_preset && found)
-      {
-        char *local_last_name = dt_util_localize_segmented_name(darktable.gui->last_preset,
-                                                                TRUE);
-        char *markup = g_markup_printf_escaped("%s <b>%s</b>",
-                                               _("update preset"),
-                                               local_last_name);
-        g_free(local_last_name);
-        mi = gtk_menu_item_new_with_label("");
-        gtk_label_set_markup(GTK_LABEL(gtk_bin_get_child(GTK_BIN(mi))), markup);
-        g_object_set_data_full(G_OBJECT(mi), "dt-preset-name",
-                               g_strdup(darktable.gui->last_preset), g_free);
-        g_signal_connect(G_OBJECT(mi), "activate",
-                         G_CALLBACK(_menuitem_update_preset), module);
-        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
-        g_free(markup);
-      }
-    }
-  }
-
-  // and the parameters entry if needed
-  if(module
-     && (module->set_preferences
-         || module->flags() & IOP_FLAGS_GUIDES_WIDGET))
-  {
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-    // the guide checkbox
-    if(module->flags() & IOP_FLAGS_GUIDES_WIDGET)
-      dt_guides_add_module_menuitem(menu, module);
-    // the specific parameters
-    if(module->set_preferences) module->set_preferences(GTK_MENU_SHELL(menu), module);
-  }
-
-  _click_time = 0;
-
-  return menu;
+  darktable.gui->active_popover_menu = dt_gui_presets_popup_menu_show(button, &ops);
 }
 
 void dt_gui_presets_update_mml(const char *name,

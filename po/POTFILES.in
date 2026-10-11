@@ -34,9 +34,11 @@ build/lib/darktable/plugins/introspection_colorout.c
 build/lib/darktable/plugins/introspection_colorreconstruction.c
 build/lib/darktable/plugins/introspection_colortransfer.c
 build/lib/darktable/plugins/introspection_colorzones.c
+build/lib/darktable/plugins/introspection_contrastntexture.c
 build/lib/darktable/plugins/introspection_crop.c
 build/lib/darktable/plugins/introspection_defringe.c
 build/lib/darktable/plugins/introspection_demosaic.c
+build/lib/darktable/plugins/introspection_demosaicscale.c
 build/lib/darktable/plugins/introspection_denoiseprofile.c
 build/lib/darktable/plugins/introspection_diffuse.c
 build/lib/darktable/plugins/introspection_dither.c
@@ -79,11 +81,13 @@ build/lib/darktable/plugins/introspection_retouch.c
 build/lib/darktable/plugins/introspection_rgbcurve.c
 build/lib/darktable/plugins/introspection_rgblevels.c
 build/lib/darktable/plugins/introspection_rotatepixels.c
+build/lib/darktable/plugins/introspection_satcurvergb.c
 build/lib/darktable/plugins/introspection_scalepixels.c
 build/lib/darktable/plugins/introspection_shadhi.c
 build/lib/darktable/plugins/introspection_sharpen.c
 build/lib/darktable/plugins/introspection_sigmoid.c
 build/lib/darktable/plugins/introspection_soften.c
+build/lib/darktable/plugins/introspection_spektrafilm.c
 build/lib/darktable/plugins/introspection_splittoning.c
 build/lib/darktable/plugins/introspection_spots.c
 build/lib/darktable/plugins/introspection_temperature.c
@@ -245,6 +249,7 @@ src/imageio/imageio.c
 src/imageio/imageio_dng.c
 src/imageio/imageio_libraw.c
 src/imageio/imageio_qoi.c
+src/imageio/storage/clipboard.c
 src/imageio/storage/disk.c
 src/imageio/storage/email.c
 src/imageio/storage/gallery.c
@@ -283,6 +288,7 @@ src/iop/colorout.c
 src/iop/colorreconstruction.c
 src/iop/colortransfer.c
 src/iop/colorzones.c
+src/iop/contrastntexture.c
 src/iop/crop.c
 src/iop/defringe.c
 src/iop/demosaic.c
@@ -293,6 +299,7 @@ src/iop/demosaicing/passthrough.c
 src/iop/demosaicing/ppg.c
 src/iop/demosaicing/vng.c
 src/iop/demosaicing/xtrans.c
+src/iop/demosaicscale.c
 src/iop/denoiseprofile.c
 src/iop/diffuse.c
 src/iop/dither.c
@@ -335,11 +342,13 @@ src/iop/retouch.c
 src/iop/rgbcurve.c
 src/iop/rgblevels.c
 src/iop/rotatepixels.c
+src/iop/satcurvergb.c
 src/iop/scalepixels.c
 src/iop/shadhi.c
 src/iop/sharpen.c
 src/iop/sigmoid.c
 src/iop/soften.c
+src/iop/spektrafilm.c
 src/iop/splittoning.c
 src/iop/spots.c
 src/iop/temperature.c

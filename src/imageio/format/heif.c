@@ -26,6 +26,7 @@
 
 #include <glib/gstdio.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -116,6 +117,28 @@ void init(dt_imageio_module_format_t *self)
 void cleanup(dt_imageio_module_format_t *self)
 {
 }
+
+#if LIBHEIF_HAVE_VERSION(1, 15, 0)
+/*
+ * SMPTE ST 2084 (PQ) EOTF: map a normalized PQ-encoded value in [0, 1] to
+ * absolute luminance in cd/m^2 (nits), peak white = 10000 nits.
+ */
+static float _pq_to_nits(const float e)
+{
+  const float m1 = 0.1593017578125f;   /* 2610 / 16384      */
+  const float m2 = 78.84375f;          /* 2523 / 4096 * 128 */
+  const float c1 = 0.8359375f;         /* 3424 / 4096       */
+  const float c2 = 18.8515625f;        /* 2413 / 4096 * 32  */
+  const float c3 = 18.6875f;           /* 2392 / 4096 * 32  */
+
+  const float ep = powf(CLAMP(e, 0.0f, 1.0f), 1.0f / m2);
+  const float num = fmaxf(ep - c1, 0.0f);
+  const float den = c2 - c3 * ep;
+  if(den <= 0.0f) return 10000.0f;
+  return 10000.0f * powf(num / den, 1.0f / m1);
+}
+
+#endif
 
 int write_image(dt_imageio_module_data_t *data,
                 const char *filename,
@@ -324,7 +347,57 @@ int write_image(dt_imageio_module_data_t *data,
     }
   }
 
+#if LIBHEIF_HAVE_VERSION(1, 15, 0)
+  /*
+   * HDR10 content light level (clli) metadata.
+   *
+   * For PQ (SMPTE ST 2084) output the float samples are absolute-luminance
+   * encoded, so we can derive the real content light levels from the pixels:
+   *   - MaxCLL  = the brightest single sample (max RGB component) in nits,
+   *   - MaxFALL = the mean over all samples of that per-sample peak.
+   * Players and HDR displays use these to tone-map appropriately. We only write
+   * them for PQ; HLG is relative and has no fixed nit scale.
+   */
+  if(!need_to_embed_icc
+     && nclx_profile->transfer_characteristics == heif_transfer_characteristic_ITU_R_BT_2100_0_PQ)
+  {
+    const size_t npixels = width * height;
+    float max_cll = 0.0f;
+    double sum_fall = 0.0;
+
+    DT_OMP_FOR_SIMD(reduction(max : max_cll) reduction(+ : sum_fall))
+    for(size_t k = 0; k < npixels; k++)
+    {
+      const float *const px = &in_data[4 * k];
+      const float e_max = fmaxf(fmaxf(px[0], px[1]), px[2]);
+      const float nits_raw = _pq_to_nits(e_max);
+      // ignore NaN/Inf samples: they would poison the MaxFALL sum and make the
+      // final 16-bit clli cast undefined.
+      const float nits = isfinite(nits_raw) ? nits_raw : 0.0f;
+      max_cll = fmaxf(max_cll, nits);
+      sum_fall += nits;
+    }
+    const float max_fall = npixels ? (float)(sum_fall / (double)npixels) : 0.0f;
+
+    const struct heif_content_light_level cll = {
+      .max_content_light_level     = (uint16_t)CLAMP(roundf(max_cll),  0.0f, 65535.0f),
+      .max_pic_average_light_level = (uint16_t)CLAMP(roundf(max_fall), 0.0f, 65535.0f),
+    };
+    heif_image_set_content_light_level(image, &cll);
+
+    dt_print(DT_DEBUG_IMAGEIO, "[heif HDR10 clli: MaxCLL=%u nits, MaxFALL=%u nits]",
+             cll.max_content_light_level, cll.max_pic_average_light_level);
+  }
+#endif
+
   struct heif_context* context = heif_context_alloc();
+  if(!context)
+  {
+    dt_print(DT_DEBUG_ALWAYS, "[heif export] failed to allocate context");
+    heif_image_release(image);
+    heif_nclx_color_profile_free(nclx_profile);
+    return 1; // failure
+  }
 
   struct heif_encoder* encoder;
   // we will use HEVC compression as the most commonly supported
@@ -409,7 +482,7 @@ int write_image(dt_imageio_module_data_t *data,
     return 1; // failure
   }
 
-#ifdef HAVE_LIBSHARPYUV
+#if defined(HAVE_LIBSHARPYUV) && LIBHEIF_HAVE_VERSION(1, 16, 0)
   options->color_conversion_options.preferred_chroma_downsampling_algorithm = heif_chroma_downsampling_sharp_yuv;
   options->color_conversion_options.only_use_preferred_chroma_algorithm = FALSE;
 #endif
@@ -757,10 +830,13 @@ void gui_reset(dt_imageio_module_format_t *self)
     dt_confgen_get_int("plugins/imageio/format/heif/quality", DT_DEFAULT);
   const int compression_type =
     dt_confgen_get_int("plugins/imageio/format/heif/compression_type", DT_DEFAULT);
+  const int subsample =
+    dt_confgen_get_int("plugins/imageio/format/heif/subsample", DT_DEFAULT);
 
   dt_bauhaus_slider_set(gui->quality, quality);
   dt_bauhaus_combobox_set(gui->compression_type, compression_type);
   dt_bauhaus_combobox_set(gui->bit_depth, _bit_depth_to_pos(bit_depth));
+  dt_bauhaus_combobox_set(gui->subsample, subsample);
 }
 
 // clang-format off

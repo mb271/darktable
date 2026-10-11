@@ -71,13 +71,17 @@ typedef struct dt_lib_history_t
 static void _lib_history_compress_clicked_callback(GtkButton *widget,
                                                    gpointer user_data);
 
-static gboolean _lib_history_compress_pressed_callback(GtkWidget *widget,
-                                                       GdkEventButton *e,
-                                                       gpointer user_data);
+static void _lib_history_compress_pressed_callback(GtkGestureSingle *gesture,
+                                                   gint n_press,
+                                                   gdouble x,
+                                                   gdouble y,
+                                                   dt_lib_module_t *self);
 
-static gboolean _lib_history_button_clicked_callback(GtkWidget *widget,
-                                                     GdkEventButton *e,
-                                                     dt_lib_module_t *self);
+static void _lib_history_button_clicked_callback(GtkGestureSingle *gesture,
+                                                 gint n_press,
+                                                 gdouble x,
+                                                 gdouble y,
+                                                 dt_lib_module_t *self);
 
 static void _lib_history_create_style_button_clicked_callback(GtkWidget *widget,
                                                               gpointer user_data);
@@ -140,19 +144,18 @@ void gui_init(dt_lib_module_t *self)
     (self, N_("compress history stack"), _lib_history_compress_clicked_callback, self,
      _("create a minimal history stack which produces the same image\n"
        "ctrl+click to truncate history to the selected item"), 0, 0);
-  g_signal_connect(G_OBJECT(d->compress_button), "button-press-event",
-                   G_CALLBACK(_lib_history_compress_pressed_callback), self);
+  dt_gui_connect_click(d->compress_button, _lib_history_compress_pressed_callback, NULL, self);
 
   /* add toolbar button for creating style */
-  d->create_button = dtgtk_button_new(dtgtk_cairo_paint_styles, CPF_NONE, NULL);
-  g_signal_connect(G_OBJECT(d->create_button), "clicked",
-                   G_CALLBACK(_lib_history_create_style_button_clicked_callback), NULL);
+  d->create_button = dtgtk_button_new_full(dtgtk_cairo_paint_styles, CPF_NONE, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("create a style from the current history stack"),
+        .action = DT_ACTION(self),
+        .action_label = N_("create style from history"),
+        .action_def = &dt_action_def_button,
+        .clicked_cb = G_CALLBACK(_lib_history_create_style_button_clicked_callback),
+      });
   gtk_widget_set_name(d->create_button, "non-flat");
-  gtk_widget_set_tooltip_text(d->create_button,
-                              _("create a style from the current history stack"));
-  dt_action_define(DT_ACTION(self), NULL,
-                   N_("create style from history"),
-                   d->create_button, &dt_action_def_button);
 
   self->widget = dt_gui_vbox
     (dt_ui_resize_wrap(d->history_box, 1, "plugins/darkroom/history/windowheight"),
@@ -203,22 +206,28 @@ static GtkWidget *_lib_history_create_button(dt_lib_module_t *self,
   gtk_label_set_markup (GTK_LABEL (lab), label);
   if(always_on)
   {
-    onoff = dtgtk_button_new(dtgtk_cairo_paint_switch_on, 0, NULL);
+    onoff = dtgtk_button_new_full(dtgtk_cairo_paint_switch_on, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("always-on module"),
+      });
     dtgtk_button_set_active(DTGTK_BUTTON(onoff), TRUE);
-    gtk_widget_set_tooltip_text(onoff, _("always-on module"));
   }
   else if(default_enabled)
   {
-    onoff = dtgtk_button_new(dtgtk_cairo_paint_switch, 0, NULL);
+    onoff = dtgtk_button_new_full(dtgtk_cairo_paint_switch, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("default enabled module"),
+      });
     dtgtk_button_set_active(DTGTK_BUTTON(onoff), enabled);
-    gtk_widget_set_tooltip_text(onoff, _("default enabled module"));
   }
   else
   {
     if(deprecated)
     {
-      onoff = dtgtk_button_new(dtgtk_cairo_paint_switch_deprecated, 0, NULL);
-      gtk_widget_set_tooltip_text(onoff, _("deprecated module"));
+      onoff = dtgtk_button_new_full(dtgtk_cairo_paint_switch_deprecated, 0, NULL,
+        &(dtgtk_button_config_t){
+          .tooltip = _("deprecated module"),
+        });
     }
     else
     {
@@ -235,9 +244,13 @@ static GtkWidget *_lib_history_create_button(dt_lib_module_t *self,
 
   if(selected) gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), TRUE);
 
-  /* set callback when clicked */
-  g_signal_connect(G_OBJECT(widget), "button-press-event",
-                   G_CALLBACK(_lib_history_button_clicked_callback), self);
+  /* Handle the press before GtkToggleButton's TARGET-phase default gesture.
+   * This lets an active-row re-click claim the sequence before the widget can
+   * toggle itself off, while unclaimed presses still reach normal handling. */
+  GtkGestureSingle *history_gesture =
+    dt_gui_connect_click(widget, _lib_history_button_clicked_callback, NULL, self);
+  gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(history_gesture),
+                                             GTK_PHASE_CAPTURE);
 
   /* associate the history number */
   g_object_set_data(G_OBJECT(widget), "history-number", GINT_TO_POINTER(num + 1));
@@ -506,9 +519,10 @@ static gboolean _create_deleted_modules(GList **_iop_list, GList *history_list)
 
       if(!dt_iop_is_hidden(module))
       {
-        DT_ENTER_GUI_UPDATE();
-        module->gui_init(module);
-        DT_LEAVE_GUI_UPDATE();
+        /** this works inside correct DT_ENTER/LEAVE_GUI_UPDATE()
+            and ensures the module->gui_lock nutex is correctly intialized.
+        */
+        dt_iop_gui_init(module);
       }
 
       // adjust the multi_name of the new module
@@ -566,6 +580,11 @@ static void _pop_undo(gpointer user_data,
 
     GList *iop_temp = g_list_copy(dev->iop);
 
+    // Undo/redo can destroy module GUI data and alter the module topology.
+    // Keep all screen pipes quiescent until the replacement develop state is
+    // complete, so no old node can resume with a cleaned-up module GUI.
+    dt_dev_pixelpipe_stop_and_lock_all(dev);
+
     // topology has changed?
     gboolean pipe_remove = FALSE;
 
@@ -619,6 +638,8 @@ static void _pop_undo(gpointer user_data,
     dt_pthread_mutex_unlock(&dev->history_mutex);
 
     dt_ioppr_resync_modules_order(dev);
+
+    dt_dev_pixelpipe_unlock_all(dev);
 
     dt_dev_modulegroups_set(darktable.develop,
                             dt_dev_modulegroups_get(darktable.develop));
@@ -761,8 +782,11 @@ static gchar *_lib_history_change_text(dt_introspection_field_t *field,
   case DT_INTROSPECTION_TYPE_ARRAY:
     if(field->Array.type == DT_INTROSPECTION_TYPE_CHAR)
     {
+      // stored params need not terminate the array; the checks below stop only at NUL
       const gboolean is_valid =
-        g_utf8_validate((char *)o, -1, NULL)
+        memchr(o, '\0', field->Array.count)
+        && memchr(p, '\0', field->Array.count)
+        && g_utf8_validate((char *)o, -1, NULL)
         && g_utf8_validate((char *)p, -1, NULL);
 
       if(is_valid && strncmp((char*)o, (char*)p, field->Array.count))
@@ -1188,51 +1212,7 @@ void gui_update(dt_lib_module_t *self)
 
 static void _lib_history_truncate(const gboolean compress)
 {
-  const dt_imgid_t imgid = darktable.develop->image_storage.id;
-  if(!dt_is_valid_imgid(imgid)) return;
-
-  dt_dev_undo_start_record(darktable.develop);
-
-  // As dt_history_compress_on_image does *not* use the history stack data at all
-  // make sure the current stack is in the database
-  dt_dev_write_history(darktable.develop);
-
-  if(compress)
-    dt_history_compress_on_image(imgid);
-  else
-    dt_history_truncate_on_image(imgid, darktable.develop->history_end);
-
-  sqlite3_stmt *stmt;
-
-  // load new history and write it back to ensure that all history are
-  // properly numbered without a gap
-  dt_dev_reload_history_items(darktable.develop);
-  dt_dev_write_history(darktable.develop);
-  dt_image_synch_xmp(imgid);
-
-  // then we can get the item to select in the new clean-up history
-  // retrieve the position of the module corresponding to the history
-  // end.  clang-format off
-  DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-                              "SELECT IFNULL(MAX(num)+1, 0)"
-                              " FROM main.history"
-                              " WHERE imgid=?1", -1, &stmt, NULL);
-  // clang-format on
-  DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, imgid);
-
-  if(sqlite3_step(stmt) == SQLITE_ROW)
-    darktable.develop->history_end = sqlite3_column_int(stmt, 0);
-  sqlite3_finalize(stmt);
-
-  // select the new history end corresponding to the one before the history compression
-  dt_image_set_history_end(imgid, darktable.develop->history_end);
-
-  dt_dev_reload_history_items(darktable.develop);
-  dt_dev_undo_end_record(darktable.develop);
-
-  dt_dev_modulegroups_set(darktable.develop, dt_dev_modulegroups_get(darktable.develop));
-
-  DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_DEVELOP_HISTORY_INVALIDATED);
+  dt_dev_history_truncate(darktable.develop, compress);
 }
 
 
@@ -1241,32 +1221,55 @@ static void _lib_history_compress_clicked_callback(GtkButton *widget, gpointer u
   _lib_history_truncate(TRUE);
 }
 
-static gboolean _lib_history_compress_pressed_callback(GtkWidget *widget,
-                                                       GdkEventButton *e,
-                                                       gpointer user_data)
+static void _lib_history_compress_pressed_callback(GtkGestureSingle *gesture,
+                                                   gint n_press,
+                                                   gdouble x,
+                                                   gdouble y,
+                                                   dt_lib_module_t *self)
 {
-  const gboolean compress = !dt_modifier_is(e->state, GDK_CONTROL_MASK);
-  _lib_history_truncate(compress);
+  /* Claim the sequence, replacing the `return TRUE` of the button-press-event
+   * handler this gesture was converted from.  Without it GtkButton's own
+   * gesture still completes the click and emits "clicked", so
+   * _lib_history_compress_clicked_callback would run _lib_history_truncate()
+   * a second time -- on release, while the pixelpipe job started by this call
+   * is still running -- and ctrl+click would truncate and then compress. */
+  dt_gui_claim(gesture);
 
-  return TRUE;
+  const gboolean compress = !(dt_key_modifier_state() & GDK_CONTROL_MASK);
+  _lib_history_truncate(compress);
 }
 
-static gboolean _lib_history_button_clicked_callback(GtkWidget *widget,
-                                                     GdkEventButton *e,
-                                                     dt_lib_module_t *self)
+static void _lib_history_button_clicked_callback(GtkGestureSingle *gesture,
+                                                 gint n_press,
+                                                 gdouble x,
+                                                 gdouble y,
+                                                 dt_lib_module_t *self)
 {
+  GtkWidget *widget = dt_gui_get_widget(gesture);
   const dt_imgid_t imgid = darktable.develop->image_storage.id;
-  if(!dt_is_valid_imgid(imgid)) return FALSE;
+  if(!dt_is_valid_imgid(imgid)) return;
 
   static gboolean reset = FALSE;
 
-  if(reset) return FALSE;
+  if(reset) return;
 
-  if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget))) return FALSE;
+  if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget)))
+  {
+    // Exactly one history row must stay selected. Claiming the press prevents
+    // GtkToggleButton's default gesture from toggling the active row off.
+    dt_gui_claim(gesture);
+    return;
+  }
 
   // shift-click just show the corresponding module in modulegroups
-  if(dt_modifier_is(e->state, GDK_SHIFT_MASK))
+  if(dt_key_modifier_state() & GDK_SHIFT_MASK)
   {
+    /* Claim the sequence, replacing the `return TRUE` of the button-press-event
+     * handler this gesture was converted from: the history entry must only be
+     * revealed in modulegroups, not selected, so GtkToggleButton must not get
+     * to complete the click and flip its state. */
+    dt_gui_claim(gesture);
+
     const int num = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "history-number"));
     dt_dev_history_item_t *hist = g_list_nth_data(darktable.develop->history, num - 1);
     if(hist)
@@ -1274,7 +1277,7 @@ static gboolean _lib_history_button_clicked_callback(GtkWidget *widget,
       dt_dev_modulegroups_switch(darktable.develop, hist->module);
       dt_iop_gui_set_expanded(hist->module, TRUE, TRUE);
     }
-    return TRUE;
+    return;
   }
 
   dt_lib_history_t *d = self->data;
@@ -1292,7 +1295,7 @@ static gboolean _lib_history_button_clicked_callback(GtkWidget *widget,
   g_list_free(children);
 
   reset = FALSE;
-  DT_GUARD_GUI_UPDATE(FALSE);
+  if(dt_atomic_get_int(&darktable.gui->reset) != 0) return;
 
   dt_dev_undo_start_record(darktable.develop);
 
@@ -1310,7 +1313,6 @@ static gboolean _lib_history_button_clicked_callback(GtkWidget *widget,
 
   dt_iop_connect_accels_all();
   dt_dev_modulegroups_set(darktable.develop, dt_dev_modulegroups_get(darktable.develop));
-  return FALSE;
 }
 
 static void _lib_history_create_style_button_clicked_callback(GtkWidget *widget,

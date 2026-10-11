@@ -795,9 +795,6 @@ static int _ellipse_events_button_released(dt_iop_module_t *module,
                                            dt_masks_form_gui_t *gui,
                                            const int index)
 {
-  float wd, ht, iwidth, iheight;
-  dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
-
   if(which == 3
      && dt_is_valid_maskid(parentid)
      && gui->edit_mode == DT_MASKS_EDIT_FULL)
@@ -832,17 +829,9 @@ static int _ellipse_events_button_released(dt_iop_module_t *module,
   }
   if(gui->form_dragging)
   {
-    // we get the ellipse
-    dt_masks_point_ellipse_t *ellipse = form->points->data;
-
     // we end the form dragging
     gui->form_dragging = FALSE;
 
-    // we change the center value
-    float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
-    dt_dev_distort_backtransform(darktable.develop, pts, 1);
-    ellipse->center[0] = pts[0] / iwidth;
-    ellipse->center[1] = pts[1] / iheight;
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
     // we recreate the form points
@@ -894,54 +883,10 @@ static int _ellipse_events_button_released(dt_iop_module_t *module,
   }
   else if(gui->form_rotating && gui->edit_mode == DT_MASKS_EDIT_FULL)
   {
-    // we get the ellipse
-    dt_masks_point_ellipse_t *ellipse = form->points->data;
-
-    // we end the form rotating
+    // rotation was applied incrementally in mouse_moved; just finalise
     gui->form_rotating = FALSE;
-
-    const float x = pzx * wd;
-    const float y = pzy * ht;
-
-    // we need the reference point
-    dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
-    if(!gpt) return 0;
-
-    // pivot for reading the final mouse sweep: the center of the shape the mouse
-    // is circling (source for a joint rotation grabbed on the source), matching
-    // the mouse_moved branch above.
-    const float xref = gui->rotate_about_source ? gpt->source[0] : gpt->points[0];
-    const float yref = gui->rotate_about_source ? gpt->source[1] : gpt->points[1];
-
-    const float pts[8] = { xref, yref, x , y, 0, 0, gui->dx, gui->dy };
-
-    const float dv = atan2f(pts[3] - pts[1],
-                            pts[2] - pts[0]) - atan2f(-(pts[7] - pts[5]),
-                                                      -(pts[6] - pts[4]));
-
-    float pts2[8] = { xref, yref, x , y, xref+10.0f, yref, xref, yref+10.0f };
-    dt_dev_distort_backtransform(darktable.develop, pts2, 4);
-
-    float check_angle = atan2f(pts2[7] - pts2[1],
-                               pts2[6] - pts2[0]) - atan2f(pts2[5] - pts2[1],
-                                                           pts2[4] - pts2[0]);
-    // Normalize to the range -180 to 180 degrees
-    check_angle = atan2f(sinf(check_angle), cosf(check_angle));
-    if(check_angle < 0)
-      ellipse->rotation -= rad2degf(dv);
-    else
-      ellipse->rotation += rad2degf(dv);
-
-    // Rotation behavior (counter_rotate_source is set at button-press time):
-    // - CTRL only (target): only the target rotates, the source stays fixed
-    //   (counter_rotate_source == TRUE, so the branch below is skipped)
-    // - CTRL+SHIFT: both shapes rotate together by the same amount
-    //   (counter_rotate_source == FALSE, so the source angle follows)
-    if(!gui->counter_rotate_source)
-      form->source[2] += dv;
-
-    dt_conf_set_float(DT_MASKS_CONF(form->type, ellipse, rotation), ellipse->rotation);
     gui->rotate_about_source = FALSE;
+    gui->scrollx = gui->scrolly = 0.0f;
 
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
@@ -952,24 +897,9 @@ static int _ellipse_events_button_released(dt_iop_module_t *module,
   }
   else if(gui->source_rotating && gui->edit_mode == DT_MASKS_EDIT_FULL)
   {
+    // rotation was applied incrementally in mouse_moved; just finalise
     gui->source_rotating = FALSE;
-
-    const float x = pzx * wd;
-    const float y = pzy * ht;
-
-    dt_masks_form_gui_points_t *gpt = g_list_nth_data(gui->points, index);
-    if(!gpt) return 0;
-
-    const float xref = gpt->source[0];
-    const float yref = gpt->source[1];
-
-    const float pts[8] = { xref, yref, x , y, 0, 0, gui->dx, gui->dy };
-
-    const float dv = atan2f(pts[3] - pts[1],
-                            pts[2] - pts[0]) - atan2f(-(pts[7] - pts[5]),
-                                                      -(pts[6] - pts[4]));
-
-    form->source[2] += dv;
+    gui->scrollx = gui->scrolly = 0.0f;
 
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
@@ -1002,22 +932,6 @@ static int _ellipse_events_button_released(dt_iop_module_t *module,
     // we end the form dragging
     gui->source_dragging = FALSE;
 
-    if(gui->scrollx != 0.0
-       || gui->scrolly != 0.0)
-    {
-      // if there's no dragging the source is calculated in
-      // _ellipse_events_button_pressed()
-    }
-    else
-    {
-      // we change the center value
-      float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
-
-      dt_dev_distort_backtransform(darktable.develop, pts, 1);
-
-      form->source[0] = pts[0] / iwidth;
-      form->source[1] = pts[1] / iheight;
-    }
     dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 
     // we recreate the form points
@@ -1057,6 +971,7 @@ static int _ellipse_events_mouse_moved(dt_iop_module_t *module,
     float wd, ht, iwidth, iheight;
     dt_masks_get_image_size(&wd, &ht, &iwidth, &iheight);
     float pts[2] = { pzx * wd + gui->dx, pzy * ht + gui->dy };
+    dt_masks_clamp_move_pts(pts, wd, ht);
     dt_dev_distort_backtransform(darktable.develop, pts, 1);
 
     if(gui->form_dragging)
@@ -1192,7 +1107,7 @@ static int _ellipse_events_mouse_moved(dt_iop_module_t *module,
                                                            pts2[4] - pts2[0]);
     // Normalize to the range -180 to 180 degrees
     check_angle = atan2f(sinf(check_angle), cosf(check_angle));
-    
+
     float diff = (check_angle < 0) ? -rad2degf(dv) : rad2degf(dv);
 
     // Rotation behavior (counter_rotate_source is set at button-press time):
@@ -1243,7 +1158,7 @@ static int _ellipse_events_mouse_moved(dt_iop_module_t *module,
                                                            pts2[4] - pts2[0]);
     // Normalize to the range -180 to 180 degrees
     check_angle = atan2f(sinf(check_angle), cosf(check_angle));
-    
+
     float diff = (check_angle < 0) ? -dv : dv;
     form->source[2] += diff;
 
@@ -2151,13 +2066,13 @@ static void _ellipse_set_hint_message(const dt_masks_form_gui_t *const gui,
   else if(gui->form_selected)
   {
     g_snprintf(msgbuf, msgbuf_len,
-               _("<b>feather mode</b>: alt+click, <b>rotate</b>: ctrl+drag\n"
-                 "<b>size</b>: scroll, <b>feather size</b>: shift+scroll,"
+               _("<b>feather mode</b>: alt+click, <b>rotate</b>: ctrl+drag,"
+                 "<b>size</b>: scroll\n<b>feather size</b>: shift+scroll"
                  " <b>opacity</b>: ctrl+scroll (%d%%)"), opacity);
     // joint rotation of both shapes only makes sense when there is a source
     // (clone/heal forms, e.g. in the retouch module)
     if(form->type & DT_MASKS_CLONE)
-      g_strlcat(msgbuf, _("\n<b>rotate both</b>: shift+ctrl+drag"), msgbuf_len);
+      g_strlcat(msgbuf, _("<b>rotate both</b>: shift+ctrl+drag"), msgbuf_len);
   }
 }
 

@@ -98,7 +98,7 @@ static gboolean _lib_duplicate_caption_out_callback(GtkWidget *widget,
   return FALSE;
 }
 
-// create a 'virgin' duplicate of imgid, without any development
+// create a 'virgin' duplicate of imgid, discarding the source history stack
 static void _lib_duplicate_original(const dt_imgid_t imgid)
 {
   const dt_imgid_t newid = dt_image_duplicate(imgid);
@@ -176,40 +176,42 @@ static void _lib_duplicate_delete(GtkButton *button, dt_lib_module_t *self)
                              g_list_prepend(NULL, GINT_TO_POINTER(imgid)));
 }
 
-static gboolean _lib_duplicate_thumb_press_callback(GtkWidget *widget,
-                                                    GdkEventButton *event,
-                                                    dt_lib_module_t *self)
+static void _lib_duplicate_thumb_press_callback(GtkGestureSingle *gesture,
+                                                gint n_press,
+                                                gdouble x,
+                                                gdouble y,
+                                                dt_lib_module_t *self)
 {
   dt_lib_duplicate_t *d = self->data;
+  GtkWidget *widget = dt_gui_get_widget(gesture);
   dt_thumbnail_t *thumb = (dt_thumbnail_t *)g_object_get_data(G_OBJECT(widget), "thumb");
   const dt_imgid_t imgid = thumb->imgid;
 
-  if(dt_gdk_event_get_button(event) == GDK_BUTTON_PRIMARY)
+  if(gtk_gesture_single_get_current_button(gesture) == GDK_BUTTON_PRIMARY)
   {
-    if(dt_gdk_event_get_type(event) == GDK_BUTTON_PRESS)
+    if(n_press == 1)
     {
       d->imgid = imgid;
       dt_control_queue_redraw_center();
     }
-    else if(dt_gdk_event_get_type(event) == GDK_2BUTTON_PRESS)
+    else if(n_press >= 2)
     {
       // let's switch to the new image
       DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_VIEWMANAGER_THUMBTABLE_ACTIVATE, imgid);
     }
   }
-  return TRUE;
 }
 
-static gboolean _lib_duplicate_thumb_release_callback(GtkWidget *widget,
-                                                      GdkEventButton *event,
-                                                      dt_lib_module_t *self)
+static void _lib_duplicate_thumb_release_callback(GtkGestureSingle *gesture,
+                                                  gint n_press,
+                                                  gdouble x,
+                                                  gdouble y,
+                                                  dt_lib_module_t *self)
 {
   dt_lib_duplicate_t *d = self->data;
 
   d->imgid = NO_IMGID;
   dt_control_queue_redraw_center();
-
-  return TRUE;
 }
 
 void view_leave(struct dt_lib_module_t *self,
@@ -336,10 +338,8 @@ static void _lib_duplicate_init_callback(gpointer instance, dt_lib_module_t *sel
 
     if(imgid != dev->image_storage.id)
     {
-      g_signal_connect(G_OBJECT(thumb->w_main), "button-press-event",
-                       G_CALLBACK(_lib_duplicate_thumb_press_callback), self);
-      g_signal_connect(G_OBJECT(thumb->w_main), "button-release-event",
-                       G_CALLBACK(_lib_duplicate_thumb_release_callback), self);
+      dt_gui_connect_click(thumb->w_main, _lib_duplicate_thumb_press_callback,
+                            _lib_duplicate_thumb_release_callback, self);
     }
 
     gchar chl[256];
@@ -356,44 +356,65 @@ static void _lib_duplicate_init_callback(gpointer instance, dt_lib_module_t *sel
     GtkWidget *lb = gtk_label_new(chl);
     gtk_widget_set_hexpand(lb, TRUE);
 
-    // duplicate this image with its history stack; only useful once the image
-    // has actually been developed - otherwise it is equivalent to "original"
-    const gboolean altered = dt_image_altered(imgid);
-    GtkWidget *bt_dup = dtgtk_button_new(dtgtk_cairo_paint_multiinstance, 0, NULL);
+    // duplicate this image with its history stack
+    GtkWidget *bt_dup = dtgtk_button_new_full(dtgtk_cairo_paint_multiinstance, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("create a duplicate of this image with same history stack"),
+        .clicked_cb = G_CALLBACK(_lib_duplicate_duplicate_clicked_callback),
+        .clicked_data = self,
+      });
     dt_gui_add_class(bt_dup, "dt_duplicate_duplicate");
-    gtk_widget_set_tooltip_text(bt_dup,
-                                _("create a duplicate of this image with same history stack"));
     g_object_set_data(G_OBJECT(bt_dup), "imgid", GINT_TO_POINTER(imgid));
-    g_signal_connect(
-      G_OBJECT(bt_dup), "clicked", G_CALLBACK(_lib_duplicate_duplicate_clicked_callback), self);
 
-    // create a 'virgin' duplicate of this image, without any development
-    GtkWidget *bt_orig = dtgtk_button_new(dtgtk_cairo_paint_plus, 0, NULL);
+    // create a 'virgin' duplicate of this image, discarding the source history stack
+    GtkWidget *bt_orig = dtgtk_button_new_full(dtgtk_cairo_paint_plus, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("create a 'virgin' duplicate, discarding the source history stack"),
+        .clicked_cb = G_CALLBACK(_lib_duplicate_original_clicked_callback),
+        .clicked_data = self,
+      });
     dt_gui_add_class(bt_orig, "dt_duplicate_original");
-    gtk_widget_set_tooltip_text(
-      bt_orig, _("create a 'virgin' duplicate of this image without any development"));
     g_object_set_data(G_OBJECT(bt_orig), "imgid", GINT_TO_POINTER(imgid));
-    g_signal_connect(
-      G_OBJECT(bt_orig), "clicked", G_CALLBACK(_lib_duplicate_original_clicked_callback), self);
 
-    bt = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
+    bt = dtgtk_button_new_full(dtgtk_cairo_paint_remove, 0, NULL,
+      &(dtgtk_button_config_t){
+        .tooltip = _("delete this duplicate"),
+        .clicked_cb = G_CALLBACK(_lib_duplicate_delete),
+        .clicked_data = self,
+      });
     dt_gui_add_class(bt, "dt_duplicate_delete");
-    gtk_widget_set_tooltip_text(bt, _("delete this duplicate"));
-    //    gtk_widget_set_halign(bt, GTK_ALIGN_END);
     g_object_set_data(G_OBJECT(bt), "imgid", GINT_TO_POINTER(imgid));
-    g_signal_connect(G_OBJECT(bt), "clicked", G_CALLBACK(_lib_duplicate_delete), self);
+
+    /* Keep the number and actions in a single top row.  The delete slot is
+     * retained when its button is unavailable, so the two active buttons do
+     * not move when switching between images with and without duplicates.
+     * See https://github.com/darktable-org/darktable/pull/21955 for the
+     * discussion of reserving this space to avoid sidebar width changes. */
+    GtkWidget *delete_slot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    dt_gui_add_class(delete_slot, "dt_duplicate_delete_slot");
+    gtk_box_pack_start(GTK_BOX(delete_slot), bt, FALSE, FALSE, 0);
+
+    GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    dt_gui_add_class(buttons, "dt_duplicate_actions");
+    gtk_box_pack_start(GTK_BOX(buttons), delete_slot, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(buttons), bt_dup, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(buttons), bt_orig, FALSE, FALSE, 0);
+
+    GtkWidget *top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_pack_start(GTK_BOX(top), lb, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(top), buttons, FALSE, FALSE, 0);
 
     gtk_grid_attach(GTK_GRID(hb), thumb->w_main, 0, 0, 1, 2);
-    gtk_grid_attach(GTK_GRID(hb), lb, 1, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(hb), bt_dup, 2, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(hb), bt_orig, 3, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(hb), bt, 4, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(hb), top, 1, 0, 4, 1);
     gtk_grid_attach(GTK_GRID(hb), tb, 1, 1, 4, 1);
 
     gtk_widget_show(hb);
+    gtk_widget_show(top);
+    gtk_widget_show(buttons);
+    gtk_widget_show(delete_slot);
     gtk_widget_show(lb);
     gtk_widget_show(tb);
-    gtk_widget_set_visible(bt_dup, altered);
+    gtk_widget_show(bt_dup);
     gtk_widget_show(bt_orig);
     gtk_widget_show(bt);
 
@@ -405,11 +426,13 @@ static void _lib_duplicate_init_callback(gpointer instance, dt_lib_module_t *sel
 
   gtk_widget_show(d->duplicate_box);
 
-  // we have a single image, do not allow it to be removed so hide last bt
-  if(count==1)
+  // We have a single image, so the delete action is not available.  Keep its
+  // slot allocated so adding/removing duplicate versions does not move the
+  // other actions in the row.
+  if(count == 1)
   {
     gtk_widget_set_sensitive(bt, FALSE);
-    gtk_widget_set_visible(bt, FALSE);
+    gtk_widget_hide(bt);
   }
 
   //unblock signals

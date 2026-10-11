@@ -243,6 +243,18 @@ void dt_masks_gui_form_remove(dt_masks_form_t *form,
   }
 }
 
+// Maximum fraction of the image dimension by which a dragged mask node /
+// anchor / clone source may be pushed outside the image.
+#define DT_MASKS_MOVE_MARGIN 0.5f
+
+void dt_masks_clamp_move_pts(float *pts, const float wd, const float ht)
+{
+  const float mx = DT_MASKS_MOVE_MARGIN * wd;
+  const float my = DT_MASKS_MOVE_MARGIN * ht;
+  pts[0] = fminf(fmaxf(pts[0], -mx), wd + mx);
+  pts[1] = fminf(fmaxf(pts[1], -my), ht + my);
+}
+
 void dt_masks_gui_form_test_create(dt_masks_form_t *form,
                                    dt_masks_form_gui_t *gui,
                                    const dt_iop_module_t *module)
@@ -536,7 +548,7 @@ int dt_masks_version(void)
   return DEVELOP_MASKS_VERSION;
 }
 
-static int dt_masks_legacy_params_v1_to_v2(const dt_develop_t *dev, void *params)
+static int _masks_legacy_params_v1_to_v2(const dt_develop_t *dev, void *params)
 {
   /*
    * difference: before v2 images were originally rotated on load, and then
@@ -636,7 +648,7 @@ static int dt_masks_legacy_params_v1_to_v2(const dt_develop_t *dev, void *params
   }
 }
 
-static void dt_masks_legacy_params_v2_to_v3_transform(const dt_image_t *img,
+static void _masks_legacy_params_v2_to_v3_transform(const dt_image_t *img,
                                                       float *points)
 {
   const float w = img->width;
@@ -656,7 +668,7 @@ static void dt_masks_legacy_params_v2_to_v3_transform(const dt_image_t *img,
   points[1] = ((points[1] * ch) + cy) / h;
 }
 
-static void dt_masks_legacy_params_v2_to_v3_transform_only_rescale
+static void _masks_legacy_params_v2_to_v3_transform_only_rescale
   (const dt_image_t *img,
    float *points,
    const size_t points_count)
@@ -675,7 +687,7 @@ static void dt_masks_legacy_params_v2_to_v3_transform_only_rescale
     points[i] = ((points[i] * MIN(cw, ch))) / MIN(w, h);
 }
 
-static int dt_masks_legacy_params_v2_to_v3(const dt_develop_t *dev, void *params)
+static int _masks_legacy_params_v2_to_v3(const dt_develop_t *dev, void *params)
 {
   /*
    * difference: before v3 images were originally cropped on load
@@ -702,49 +714,49 @@ static int dt_masks_legacy_params_v2_to_v3(const dt_develop_t *dev, void *params
     if(m->type & DT_MASKS_CIRCLE)
     {
       dt_masks_point_circle_t *circle = p->data;
-      dt_masks_legacy_params_v2_to_v3_transform(img, circle->center);
-      dt_masks_legacy_params_v2_to_v3_transform_only_rescale(img, &circle->radius, 1);
-      dt_masks_legacy_params_v2_to_v3_transform_only_rescale(img, &circle->border, 1);
+      _masks_legacy_params_v2_to_v3_transform(img, circle->center);
+      _masks_legacy_params_v2_to_v3_transform_only_rescale(img, &circle->radius, 1);
+      _masks_legacy_params_v2_to_v3_transform_only_rescale(img, &circle->border, 1);
     }
     else if(m->type & DT_MASKS_PATH)
     {
       for(; p; p = g_list_next(p))
       {
         dt_masks_point_path_t *path = p->data;
-        dt_masks_legacy_params_v2_to_v3_transform(img, path->corner);
-        dt_masks_legacy_params_v2_to_v3_transform(img, path->ctrl1);
-        dt_masks_legacy_params_v2_to_v3_transform(img, path->ctrl2);
-        dt_masks_legacy_params_v2_to_v3_transform_only_rescale(img, path->border, 2);
+        _masks_legacy_params_v2_to_v3_transform(img, path->corner);
+        _masks_legacy_params_v2_to_v3_transform(img, path->ctrl1);
+        _masks_legacy_params_v2_to_v3_transform(img, path->ctrl2);
+        _masks_legacy_params_v2_to_v3_transform_only_rescale(img, path->border, 2);
       }
     }
     else if(m->type & DT_MASKS_GRADIENT)
     {
       dt_masks_point_gradient_t *gradient = p->data;
-      dt_masks_legacy_params_v2_to_v3_transform(img, gradient->anchor);
+      _masks_legacy_params_v2_to_v3_transform(img, gradient->anchor);
     }
     else if(m->type & DT_MASKS_ELLIPSE)
     {
       dt_masks_point_ellipse_t *ellipse = p->data;
-      dt_masks_legacy_params_v2_to_v3_transform(img, ellipse->center);
-      dt_masks_legacy_params_v2_to_v3_transform_only_rescale(img, ellipse->radius, 2);
-      dt_masks_legacy_params_v2_to_v3_transform_only_rescale(img, &ellipse->border, 1);
+      _masks_legacy_params_v2_to_v3_transform(img, ellipse->center);
+      _masks_legacy_params_v2_to_v3_transform_only_rescale(img, ellipse->radius, 2);
+      _masks_legacy_params_v2_to_v3_transform_only_rescale(img, &ellipse->border, 1);
     }
     else if(m->type & DT_MASKS_BRUSH)
     {
       for(; p;  p = g_list_next(p))
       {
         dt_masks_point_brush_t *brush = p->data;
-        dt_masks_legacy_params_v2_to_v3_transform(img, brush->corner);
-        dt_masks_legacy_params_v2_to_v3_transform(img, brush->ctrl1);
-        dt_masks_legacy_params_v2_to_v3_transform(img, brush->ctrl2);
-        dt_masks_legacy_params_v2_to_v3_transform_only_rescale(img, brush->border, 2);
+        _masks_legacy_params_v2_to_v3_transform(img, brush->corner);
+        _masks_legacy_params_v2_to_v3_transform(img, brush->ctrl1);
+        _masks_legacy_params_v2_to_v3_transform(img, brush->ctrl2);
+        _masks_legacy_params_v2_to_v3_transform_only_rescale(img, brush->border, 2);
       }
     }
 
     if(m->type & DT_MASKS_CLONE)
     {
       // NOTE: can be: DT_MASKS_CIRCLE, DT_MASKS_ELLIPSE, DT_MASKS_PATH
-      dt_masks_legacy_params_v2_to_v3_transform(img, m->source);
+      _masks_legacy_params_v2_to_v3_transform(img, m->source);
     }
 
     m->version = 3;
@@ -753,7 +765,7 @@ static int dt_masks_legacy_params_v2_to_v3(const dt_develop_t *dev, void *params
   }
 }
 
-static int dt_masks_legacy_params_v3_to_v4(dt_develop_t *dev, void *params)
+static int _masks_legacy_params_v3_to_v4(dt_develop_t *dev, void *params)
 {
   /*
    * difference affecting ellipse
@@ -780,7 +792,7 @@ static int dt_masks_legacy_params_v3_to_v4(dt_develop_t *dev, void *params)
 }
 
 
-static int dt_masks_legacy_params_v4_to_v5(dt_develop_t *dev, void *params)
+static int _masks_legacy_params_v4_to_v5(dt_develop_t *dev, void *params)
 {
   /*
    * difference affecting gradient
@@ -805,7 +817,7 @@ static int dt_masks_legacy_params_v4_to_v5(dt_develop_t *dev, void *params)
   return 0;
 }
 
-static int dt_masks_legacy_params_v5_to_v6(dt_develop_t *dev, void *params)
+static int _masks_legacy_params_v5_to_v6(dt_develop_t *dev, void *params)
 {
   /*
    * difference affecting gradient
@@ -846,33 +858,33 @@ int dt_masks_legacy_params(dt_develop_t *dev,
 
   if(old_version == 1 && new_version == 6)
   {
-    res = dt_masks_legacy_params_v1_to_v2(dev, params);
-    if(!res) res = dt_masks_legacy_params_v2_to_v3(dev, params);
-    if(!res) res = dt_masks_legacy_params_v3_to_v4(dev, params);
-    if(!res) res = dt_masks_legacy_params_v4_to_v5(dev, params);
-    if(!res) res = dt_masks_legacy_params_v5_to_v6(dev, params);
+    res = _masks_legacy_params_v1_to_v2(dev, params);
+    if(!res) res = _masks_legacy_params_v2_to_v3(dev, params);
+    if(!res) res = _masks_legacy_params_v3_to_v4(dev, params);
+    if(!res) res = _masks_legacy_params_v4_to_v5(dev, params);
+    if(!res) res = _masks_legacy_params_v5_to_v6(dev, params);
   }
   else if(old_version == 2 && new_version == 6)
   {
-    res = dt_masks_legacy_params_v2_to_v3(dev, params);
-    if(!res) res = dt_masks_legacy_params_v3_to_v4(dev, params);
-    if(!res) res = dt_masks_legacy_params_v4_to_v5(dev, params);
-    if(!res) res = dt_masks_legacy_params_v5_to_v6(dev, params);
+    res = _masks_legacy_params_v2_to_v3(dev, params);
+    if(!res) res = _masks_legacy_params_v3_to_v4(dev, params);
+    if(!res) res = _masks_legacy_params_v4_to_v5(dev, params);
+    if(!res) res = _masks_legacy_params_v5_to_v6(dev, params);
   }
   else if(old_version == 3 && new_version == 6)
   {
-    res = dt_masks_legacy_params_v3_to_v4(dev, params);
-    if(!res) res = dt_masks_legacy_params_v4_to_v5(dev, params);
-    if(!res) res = dt_masks_legacy_params_v5_to_v6(dev, params);
+    res = _masks_legacy_params_v3_to_v4(dev, params);
+    if(!res) res = _masks_legacy_params_v4_to_v5(dev, params);
+    if(!res) res = _masks_legacy_params_v5_to_v6(dev, params);
   }
   else if(old_version == 4 && new_version == 6)
   {
-    res = dt_masks_legacy_params_v4_to_v5(dev, params);
-    if(!res) res = dt_masks_legacy_params_v5_to_v6(dev, params);
+    res = _masks_legacy_params_v4_to_v5(dev, params);
+    if(!res) res = _masks_legacy_params_v5_to_v6(dev, params);
   }
   else if(old_version == 5 && new_version == 6)
   {
-    res = dt_masks_legacy_params_v5_to_v6(dev, params);
+    res = _masks_legacy_params_v5_to_v6(dev, params);
   }
 
   return res;
@@ -951,6 +963,11 @@ dt_masks_form_t *dt_masks_get_from_id_ext(GList *forms, const dt_mask_id_t id)
 dt_masks_form_t *dt_masks_get_from_id(const dt_develop_t *dev, const dt_mask_id_t id)
 {
   return dt_masks_get_from_id_ext(dev->forms, id);
+}
+
+static inline gboolean _sane_val(const float val)
+{
+  return !dt_isnan(val) && val >= 0.0f;
 }
 
 void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid)
@@ -1036,6 +1053,79 @@ void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid)
         char *point = malloc(point_size);
         memcpy(point, ptbuf + i*point_size, point_size);
         form->points = g_list_append(form->points, point);
+      }
+    }
+
+    /** For some reason we might find crazy radius or borders here so we check
+        and report via log and a control message.
+        We must never have a negative or NAN border/radius.
+        In case of such errors we set bad values to something that can be handled
+        in the module's mask interface
+    */
+    if(form->type & DT_MASKS_CIRCLE)
+    {
+      dt_masks_point_circle_t *ref = form->points->data;
+      const gboolean safe_radius = _sane_val(ref->radius);
+      const gboolean safe_border = _sane_val(ref->border);
+      if(!safe_radius || !safe_border)
+      {
+        dt_print(DT_DEBUG_ALWAYS,
+             "Image ID=%d has insane circle mask: radius=%.3f border=%.3f",
+             imgid, ref->radius, ref->border);
+        dt_control_log(_("Image ID=%d has insane circle mask: radius=%.3f border=%.3f"),
+          imgid, ref->radius, ref->border);
+        if(!safe_radius)  ref->radius = 0.01f;
+        if(!safe_border)  ref->border = 0.01f * ref->radius;
+      }
+    }
+    else if(form->type & DT_MASKS_ELLIPSE)
+    {
+      dt_masks_point_ellipse_t *ref = form->points->data;
+      const gboolean safe_radius0 = _sane_val(ref->radius[0]);
+      const gboolean safe_radius1 = _sane_val(ref->radius[1]);
+      const gboolean safe_border = _sane_val(ref->border);
+      if(!safe_radius0 || !safe_radius1 || !safe_border)
+      {
+        dt_print(DT_DEBUG_ALWAYS,
+             "Image ID=%d has insane ellipse mask: radii=%.3f/%.3f, border=%.3f",
+             imgid, ref->radius[0], ref->radius[1], ref->border);
+        dt_control_log(_("Image ID=%d has insane ellipse mask: radii=%.3f/%.3f, border=%.3f"),
+          imgid, ref->radius[0], ref->radius[1], ref->border);
+        if(!safe_radius0) ref->radius[0] = 0.01f;
+        if(!safe_radius1) ref->radius[1] = 0.01f;
+        if(!safe_border)  ref->border = 0.01f * ref->radius[0];
+      }
+    }
+    else if(form->type & DT_MASKS_PATH)
+    {
+      dt_masks_point_path_t *ref = form->points->data;
+      const gboolean safe_border0 = _sane_val(ref->border[0]);
+      const gboolean safe_border1 = _sane_val(ref->border[1]);
+      if(!safe_border0 || !safe_border1)
+      {
+        dt_print(DT_DEBUG_ALWAYS,
+          "Image ID=%d has insane path mask: borders=%.3f/%.3f",
+          imgid, ref->border[0], ref->border[1]);
+        dt_control_log(_("Image ID=%d has insane path mask: borders=%.3f/%.3f"),
+          imgid, ref->border[0], ref->border[1]);
+        if(!safe_border0)  ref->border[0] = 0.01f;
+        if(!safe_border1)  ref->border[1] = 0.01f;
+      }
+    }
+    else if(form->type & DT_MASKS_BRUSH)
+    {
+      dt_masks_point_brush_t *ref = form->points->data;
+      const gboolean safe_border0 = _sane_val(ref->border[0]);
+      const gboolean safe_border1 = _sane_val(ref->border[1]);
+      if(!safe_border0 || !safe_border1)
+      {
+        dt_print(DT_DEBUG_ALWAYS,
+          "Image ID=%d has insane brush mask: borders=%.3f/%.3f",
+          formid, ref->border[0], ref->border[1]);
+        dt_control_log(_("Image ID=%d has insane brush mask: borders=%.3f/%.3f"),
+          imgid, ref->border[0], ref->border[1]);
+        if(!safe_border0)  ref->border[0] = 0.1f;
+        if(!safe_border1)  ref->border[1] = 0.1f;
       }
     }
 
@@ -1166,6 +1256,50 @@ gboolean dt_masks_events_mouse_enter(dt_iop_module_t *module)
   return FALSE;
 }
 
+// the parts of the gui state that hovering can change and that the
+// shapes' post_expose() draw
+static gboolean _gui_hover_state_equal(const dt_masks_form_gui_t *a,
+                                       const dt_masks_form_gui_t *b)
+{
+  return a->form_selected == b->form_selected
+    && a->border_selected == b->border_selected
+    && a->source_selected == b->source_selected
+    && a->pivot_selected == b->pivot_selected
+    && a->select_only_border == b->select_only_border
+    && a->point_selected == b->point_selected
+    && a->point_edited == b->point_edited
+    && a->feather_selected == b->feather_selected
+    && a->bezier_ctrl == b->bezier_ctrl
+    && a->seg_selected == b->seg_selected
+    && a->point_border_selected == b->point_border_selected
+    && a->group_edited == b->group_edited
+    && a->group_selected == b->group_selected;
+}
+
+// The shapes' event callbacks run with history_mutex held. A view clamp they ask for
+// through dt_masks_set_edit_mode() takes global_mutex, so it waits for the unlock
+static int _events_locked = 0;
+static gboolean _events_zoom_move = FALSE;
+
+static void _events_lock(dt_develop_t *dev)
+  ACQUIRE(&dev->history_mutex)
+{
+  dt_pthread_mutex_lock(&dev->history_mutex);
+  _events_locked++;
+}
+
+static void _events_unlock(dt_develop_t *dev)
+  RELEASE(&dev->history_mutex)
+{
+  _events_locked--;
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+  if(!_events_locked && _events_zoom_move)
+  {
+    _events_zoom_move = FALSE;
+    dt_dev_zoom_move(&dev->full, DT_ZOOM_MOVE, 0.0f, 0, 0.0f, 0.0f, TRUE);
+  }
+}
+
 // return true in case of something has been exposed
 gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
                                      const float pzx,
@@ -1207,13 +1341,23 @@ gboolean dt_masks_events_mouse_moved(dt_iop_module_t *module,
   // form->points can be mutated below (dragging a node); pixelpipe worker
   // threads deep-copy dev->forms concurrently in dt_dev_pixelpipe_process, so
   // this must be serialized against that read (see history_mutex there).
-  dt_pthread_mutex_lock(&darktable.develop->history_mutex);
+  _events_lock(darktable.develop);
+
+  dt_masks_form_gui_t before = { 0 };
+  if(gui) before = *gui;
 
   int rep = 0;
   if(form->functions)
     rep = form->functions->mouse_moved(module, pzx, pzy, pressure, which, zoom_scale, form, 0, gui, 0);
 
-  dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
+  _events_unlock(darktable.develop);
+
+  // brushes, paths and groups don't redraw for plain hovering (a long
+  // brush or path takes long enough to draw that redrawing on every
+  // motion event makes the pointer lag), so redraw here only if the
+  // highlighted part changed
+  if(gui && !_gui_hover_state_equal(&before, gui))
+    dt_control_queue_redraw_center();
 
   if(gui) _set_hinter_message(gui, form);
 
@@ -1241,10 +1385,12 @@ gboolean dt_masks_events_button_released(dt_iop_module_t *module,
   {
     // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
     // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
-    dt_pthread_mutex_lock(&dev->history_mutex);
+    _events_lock(dev);
     ret = form->functions->button_released(module, pzx, pzy, which, state, form, 0, gui, 0);
     form->functions->mouse_moved(module, pzx, pzy, 0, which, zoom_scale, form, 0, gui, 0);
-    dt_pthread_mutex_unlock(&dev->history_mutex);
+    _events_unlock(dev);
+    // mouse_moved() no longer redraws for hovering, see dt_masks_events_mouse_moved()
+    dt_control_queue_redraw_center();
   }
 
   return ret;
@@ -1288,11 +1434,11 @@ gboolean dt_masks_events_button_pressed(dt_iop_module_t *module,
   {
     // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
     // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
-    dt_pthread_mutex_lock(&darktable.develop->history_mutex);
+    _events_lock(darktable.develop);
     const gboolean ret = form->functions->button_pressed(
                            module, pzx, pzy, pressure, which, type, state, form, 0, gui, 0) ||
                          which == 3; // swallow right-clicks so right-drag rotate is disabled
-    dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
+    _events_unlock(darktable.develop);
     return ret;
   }
   return FALSE;
@@ -1331,11 +1477,11 @@ gboolean dt_masks_events_mouse_scrolled(dt_iop_module_t *module,
   {
     // serialized against the pixelpipe's dt_masks_dup_forms_deep read of
     // dev->forms/form->points, see history_mutex use in dt_dev_pixelpipe_process.
-    dt_pthread_mutex_lock(&darktable.develop->history_mutex);
+    _events_lock(darktable.develop);
     ret = (form->functions->mouse_scrolled(module, pzx, pzy,
                                           incr ? 1 : 0,
                                           state, form, 0, gui, 0)) != 0;
-    dt_pthread_mutex_unlock(&darktable.develop->history_mutex);
+    _events_unlock(darktable.develop);
   }
 
   if(gui)
@@ -1461,6 +1607,25 @@ void dt_masks_change_form_gui(dt_masks_form_t *newform)
   DT_LEAVE_GUI_UPDATE();
 }
 
+gboolean dt_masks_cancel_creation(void)
+{
+  dt_masks_form_gui_t *gui = darktable.develop ? darktable.develop->form_gui : NULL;
+  if(!gui || !gui->creation) return FALSE;
+
+  dt_iop_module_t *module = gui->creation_module;
+  gui->creation_continuous = FALSE;
+  gui->creation_continuous_module = NULL;
+  if(module)
+  {
+    dt_masks_set_edit_mode(module, DT_MASKS_EDIT_FULL);
+    dt_masks_iop_update(module);
+  }
+  else
+    dt_masks_change_form_gui(NULL);
+  dt_control_queue_redraw_center();
+  return TRUE;
+}
+
 void dt_masks_reset_form_gui(void)
 {
   dt_masks_change_form_gui(NULL);
@@ -1472,9 +1637,13 @@ void dt_masks_reset_form_gui(void)
   {
     dt_iop_gui_blend_data_t *bd = m->blend_data;
     bd->masks_shown = DT_MASKS_EDIT_OFF;
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->masks_edit), 0);
+
+    if(bd->masks_edit)
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->masks_edit), 0);
+
     for(int n = 0; n < DEVELOP_MASKS_NB_SHAPES; n++)
-      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->masks_shapes[n]), 0);
+      if(bd->masks_shapes[n])
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(bd->masks_shapes[n]), 0);
   }
 }
 
@@ -1511,7 +1680,7 @@ dt_masks_edit_mode_t dt_masks_get_edit_mode(void)
     : DT_MASKS_EDIT_OFF;
 }
 
-gboolean dt_masks_is_restricted_mode(void)
+static inline gboolean _masks_is_restricted_mode(void)
 {
   return dt_masks_get_edit_mode() == DT_MASKS_EDIT_RESTRICTED;
 }
@@ -1534,6 +1703,7 @@ void dt_masks_set_edit_mode(dt_iop_module_t *module,
     dt_masks_group_ungroup(grp, form);
   }
 
+  const dt_masks_edit_mode_t old_shown = bd->masks_shown;
   bd->masks_shown = value;
   dt_masks_change_form_gui(grp);
   darktable.develop->form_gui->edit_mode = value;
@@ -1552,7 +1722,24 @@ void dt_masks_set_edit_mode(dt_iop_module_t *module,
   // stale. Re-validate it: this no-op clamp snaps the pan back into bounds so
   // the picture re-centres immediately instead of lingering off-centre (which
   // also leaves the renderer churning) until the next manual pan.
-  dt_dev_zoom_move(&darktable.develop->full, DT_ZOOM_MOVE, 0.0f, 0, 0.0f, 0.0f, TRUE);
+  //
+  // Not during a bulk history refresh: that reaches us from the
+  // dt_iop_gui_update() loop in dt_dev_pop_history_items(), which holds
+  // dev->history_mutex, whereas dt_dev_zoom_move() takes global_mutex and then
+  // history_mutex -- the reverse of the order a pixelpipe worker uses, so the
+  // two deadlock. Nothing is lost when hiding the overlay: after a history
+  // reload the dirty pipe runs the image-only clamp itself. Worker validation
+  // deliberately does not inspect mutable GUI overlay points.
+  // Also avoid if we didn't change edit mode
+  // Under a shape's event callback, which holds history_mutex too, the
+  // clamp waits for _events_unlock()
+  if(!darktable.develop->history_updating && old_shown != value)
+  {
+    if(_events_locked)
+      _events_zoom_move = TRUE;
+    else
+      dt_dev_zoom_move(&darktable.develop->full, DT_ZOOM_MOVE, 0.0f, 0, 0.0f, 0.0f, TRUE);
+  }
 
   dt_control_queue_redraw_center();
 }
@@ -1588,24 +1775,6 @@ void dt_masks_set_edit_mode_single_form(dt_iop_module_t *module,
   DT_LEAVE_GUI_UPDATE();
 
   dt_control_queue_redraw_center();
-}
-
-void dt_masks_iop_edit_toggle_callback(GtkToggleButton *togglebutton,
-                                       dt_iop_module_t *module)
-{
-  if(!module) return;
-  dt_iop_gui_blend_data_t *bd = module->blend_data;
-  if(module->blend_params->mask_id == NO_MASKID)
-  {
-    bd->masks_shown = DT_MASKS_EDIT_OFF;
-    return;
-  }
-
-  // reset the gui
-  dt_masks_set_edit_mode(module,
-                         (bd->masks_shown == DT_MASKS_EDIT_OFF
-                          ? DT_MASKS_EDIT_FULL
-                          : DT_MASKS_EDIT_OFF));
 }
 
 static void _menu_no_masks(dt_iop_module_t *module)
@@ -2138,6 +2307,14 @@ void dt_masks_group_ungroup(dt_masks_form_t *dest_grp,
 
 dt_hash_t dt_masks_group_hash(dt_hash_t hash, dt_masks_form_t *form)
 {
+  return dt_masks_group_hash_ext(hash, form,
+                                 darktable.develop ? darktable.develop->forms : NULL);
+}
+
+dt_hash_t dt_masks_group_hash_ext(dt_hash_t hash,
+                                  dt_masks_form_t *form,
+                                  GList *forms_list)
+{
   if(!form) return hash;
   // basic infos
   hash = dt_hash(hash, &form->type, sizeof(dt_masks_type_t));
@@ -2150,13 +2327,13 @@ dt_hash_t dt_masks_group_hash(dt_hash_t hash, dt_masks_form_t *form)
     if(form->type & DT_MASKS_GROUP)
     {
       const dt_masks_point_group_t *grpt = forms->data;
-      dt_masks_form_t *f = dt_masks_get_from_id(darktable.develop, grpt->formid);
+      dt_masks_form_t *f = dt_masks_get_from_id_ext(forms_list, grpt->formid);
       if(f)
       {
         // state & opacity
         hash = dt_hash(hash, &grpt->state, sizeof(int));
         hash = dt_hash(hash, &grpt->opacity, sizeof(float));
-        hash = dt_masks_group_hash(hash, f);
+        hash = dt_masks_group_hash_ext(hash, f, forms_list);
       }
     }
     else if(form->functions)
@@ -2738,6 +2915,27 @@ void dt_masks_calculate_source_pos_value(const dt_masks_form_gui_t *gui,
   *py = y;
 }
 
+// shapes are drawn in the overlay color over a neutral edge, white round a dark
+// color and black round a light one, so one of the two stays visible whatever
+// is underneath. Not the color's own dark shade, as guides use: that is black
+// at full contrast and vanishes over a dark picture
+static void _masks_set_line_color(cairo_t *cr, const double alpha)
+{
+  dt_draw_set_color_overlay(cr, TRUE, alpha);
+}
+
+static void _masks_set_edge_color(cairo_t *cr, const double alpha)
+{
+  const double amt = 0.5 + darktable.gui->overlay_contrast * 0.5;
+  const double lum = amt * (0.2126 * darktable.gui->overlay_red
+                            + 0.7152 * darktable.gui->overlay_green
+                            + 0.0722 * darktable.gui->overlay_blue);
+  const double edge = lum < 0.5 ? 1.0 : 0.0;
+  // the overlay contrast setting sets how far the two tones stand apart
+  cairo_set_source_rgba(cr, edge, edge, edge,
+                        alpha * (0.4 + 0.5 * darktable.gui->overlay_contrast));
+}
+
 void dt_masks_draw_anchor(cairo_t *cr,
                           const gboolean selected,
                           const float zoom_scale,
@@ -2747,7 +2945,7 @@ void dt_masks_draw_anchor(cairo_t *cr,
   const float anchor_size = DT_PIXEL_APPLY_DPI(selected ? 8.0f : 5.0f) / zoom_scale;
 
   cairo_set_dash(cr, NULL, 0, 0);
-  dt_draw_set_color_overlay(cr, TRUE, 0.8);
+  _masks_set_line_color(cr, 0.8);
   cairo_rectangle(cr,
                   x - (anchor_size * 0.5f),
                   y - (anchor_size * 0.5f),
@@ -2756,7 +2954,7 @@ void dt_masks_draw_anchor(cairo_t *cr,
   cairo_fill_preserve(cr);
   const double lwidth = (dt_iop_canvas_not_sensitive(darktable.develop) ? 0.5 : 1.0) / zoom_scale;
   cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(selected ? 2.0 : 1.0) * lwidth);
-  dt_draw_set_color_overlay(cr, FALSE, 0.8);
+  _masks_set_edge_color(cr, 1.0);
   cairo_stroke(cr);
 }
 
@@ -2770,12 +2968,12 @@ void dt_masks_draw_ctrl(cairo_t *cr,
 
   cairo_arc(cr, x, y, ctrl_size, 0, 2.0 * M_PI);
 
-  dt_draw_set_color_overlay(cr, TRUE, 0.8);
+  _masks_set_line_color(cr, 0.8);
   cairo_fill_preserve(cr);
 
   const double lwidth = (dt_iop_canvas_not_sensitive(darktable.develop) ? 0.5 : 1.0) / zoom_scale;
   cairo_set_line_width(cr, lwidth);
-  dt_draw_set_color_overlay(cr, FALSE, 0.8);
+  _masks_set_edge_color(cr, 1.0);
   cairo_stroke(cr);
 }
 
@@ -2845,7 +3043,7 @@ void dt_masks_stroke_arrow(cairo_t *cr,
   else
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5) * lwidth);
 
-  dt_draw_set_color_overlay(cr, FALSE, 0.8);
+  _masks_set_edge_color(cr, 1.0);
   cairo_stroke_preserve(cr);
 
   if((gui->group_selected == group) && (gui->form_selected || gui->form_dragging))
@@ -2853,7 +3051,7 @@ void dt_masks_stroke_arrow(cairo_t *cr,
   else
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(0.5) * lwidth);
 
-  dt_draw_set_color_overlay(cr, TRUE, 0.8);
+  _masks_set_line_color(cr, 0.8);
   cairo_stroke(cr);
 }
 
@@ -2933,10 +3131,16 @@ void dt_masks_line_stroke(cairo_t *cr,
                           const gboolean selected,
                           const float zoom_scale)
 {
+  // the colored line's width, and the edge added on each side of it
   const double size_border     = DT_PIXEL_APPLY_DPI(1.0);
   const double size_source     = DT_PIXEL_APPLY_DPI(1.5);
-  const double size_mask       = DT_PIXEL_APPLY_DPI(1.7);
-  const double factor_selected = DT_PIXEL_APPLY_DPI(1.5);
+  const double size_mask       = DT_PIXEL_APPLY_DPI(1.25);
+  const double edge_border     = DT_PIXEL_APPLY_DPI(0.75);
+  const double edge_mask       = DT_PIXEL_APPLY_DPI(0.75);
+  // a hovered or selected shape has to stand out from the ones at rest, in
+  // weight as well as in opacity
+  const double factor_selected = 2.0;
+  const double edge_selected   = 1.5;
 
   double dashed[] = { DT_PIXEL_APPLY_DPI(4.0), DT_PIXEL_APPLY_DPI(4.0) };
   dashed[0] /= zoom_scale;
@@ -2947,40 +3151,104 @@ void dt_masks_line_stroke(cairo_t *cr,
   dashed_restricted[0] /= zoom_scale;
   dashed_restricted[1] /= zoom_scale;
 
-  const gboolean restricted = dt_masks_is_restricted_mode();
-
-  // first the background draw, darker
-  if(restricted && !border)
-    dt_draw_set_color_overlay(cr, FALSE, 0.1);
-  else
-    dt_draw_set_color_overlay(cr, FALSE, selected ? 0.8 : 0.5);
-
-  cairo_set_dash(cr, dashed, border ? len : 0, 0);
+  const gboolean restricted = _masks_is_restricted_mode();
 
   const double lwidth = (dt_iop_canvas_not_sensitive(darktable.develop) ? 0.5 : 1.0) / zoom_scale;
   const double line_width =
     ((border ? size_border : (source ? size_source : size_mask))
      * (selected ? factor_selected : 1.0)) * lwidth;
+  const double edge_width =
+    (border ? edge_border : edge_mask) * (selected ? edge_selected : 1.0) * lwidth;
 
-  cairo_set_line_width(cr, line_width);
+  // first the edge, as wide as the line plus an edge on each side. A border's
+  // dashes are edged dash by dash, so it still reads as dashed. A clone source
+  // is the negative of a shape, the two tones swapped, which keeps it apart
+  // from the shape it copies to
+  if(restricted && !border)
+    _masks_set_edge_color(cr, 0.1);
+  else if(source)
+    _masks_set_line_color(cr, selected ? 1.0 : 0.6);
+  else
+    _masks_set_edge_color(cr, selected ? 1.0 : 0.6);
 
+  cairo_set_dash(cr, dashed, border ? len : 0, 0);
+  cairo_set_line_width(cr, line_width + 2.0 * edge_width);
   cairo_stroke_preserve(cr);
 
-  // second the foreground draw, lighter (same size as darker if selected)
-  cairo_set_line_width(cr, (line_width / (selected && !border ? 1.0 : 2.0)));
+  // then the line itself, in the overlay color (the edge tone for a source)
+  cairo_set_line_width(cr, line_width);
 
   if(restricted && !border)
   {
     cairo_set_dash(cr, dashed_restricted, len, 4);
-    dt_draw_set_color_overlay(cr, TRUE, 1.0);
+    _masks_set_line_color(cr, 1.0);
   }
-  else if(!source)
-  {
-    dt_draw_set_color_overlay(cr, TRUE, selected ? 0.9 : 0.6);
-    cairo_set_dash(cr, dashed, border ? len : 0, 4);
-  }
+  else if(source)
+    _masks_set_edge_color(cr, selected ? 1.0 : 0.6);
+  else
+    _masks_set_line_color(cr, selected ? 1.0 : 0.75);
 
   cairo_stroke(cr);
+}
+
+// stroke the outline points from..to, and back to from if close_path.
+// they are about one image pixel apart, so a long brush or path has
+// hundreds of thousands of them and one cairo stroke over all of them
+// stalls the GUI thread for seconds. points closer than a screen pixel
+// to the last one drawn are skipped, and the path is stroked in chunks
+// so cairo can drop the ones outside the view cheaply. a chunk is a
+// whole number of dash periods long (4+4 and 8+12 in
+// dt_masks_line_stroke()), which keeps the dashes continuous across
+// chunks.
+void dt_masks_stroke_polyline(cairo_t *cr,
+                              const float *const pts,
+                              const int from,
+                              const int to,
+                              const gboolean close_path,
+                              const gboolean border,
+                              const gboolean source,
+                              const gboolean selected,
+                              const float zoom_scale)
+{
+  const float min_dist2 = 1.0f / (zoom_scale * zoom_scale);
+  const float chunk_len = DT_PIXEL_APPLY_DPI(320.0f) / zoom_scale;
+  const int end = close_path ? to + 1 : to;
+
+  float last_x = pts[from * 2];
+  float last_y = pts[from * 2 + 1];
+  float len = 0.0f;
+  cairo_move_to(cr, last_x, last_y);
+
+  for(int i = from + 1; i <= end; i++)
+  {
+    const int k = i > to ? from : i;
+    const float x = pts[k * 2];
+    const float y = pts[k * 2 + 1];
+    float dx = x - last_x;
+    float dy = y - last_y;
+    const float d2 = dx * dx + dy * dy;
+    if(i < end && d2 < min_dist2) continue;
+
+    float d = sqrtf(d2);
+    while(len + d >= chunk_len)
+    {
+      const float t = (chunk_len - len) / d;
+      last_x += t * dx;
+      last_y += t * dy;
+      cairo_line_to(cr, last_x, last_y);
+      dt_masks_line_stroke(cr, border, source, selected, zoom_scale);
+      cairo_move_to(cr, last_x, last_y);
+      dx = x - last_x;
+      dy = y - last_y;
+      d -= chunk_len - len;
+      len = 0.0f;
+    }
+    cairo_line_to(cr, x, y);
+    len += d;
+    last_x = x;
+    last_y = y;
+  }
+  dt_masks_line_stroke(cr, border, source, selected, zoom_scale);
 }
 
 #include "detail.c"

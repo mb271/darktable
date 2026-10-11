@@ -64,7 +64,8 @@ typedef struct dt_history_copy_item_t
   GList *selops;
   GtkTreeView *items;
   dt_imgid_t copied_imageid;
-  gboolean full_copy;
+  gboolean full_copy; // bypass some IOP flags like IOP_FLAGS_UNSAFE_COPY
+                      // and IOP_FLAGS_HIDDEN, this is used for duplicate images.
   gboolean copy_iop_order;
   dt_history_copy_mode_t paste_mode;
 } dt_history_copy_item_t;
@@ -179,6 +180,9 @@ gboolean dt_history_hash_is_mipmap_synced(const dt_imgid_t imgid);
 
 /** update mipmap hash to db (= current_hash) */
 void dt_history_hash_set_mipmap(const dt_imgid_t imgid);
+
+/** clear mipmap hash */
+void dt_history_hash_unset_mipmap(const dt_imgid_t imgid);
 
 /** write hash values to db */
 void dt_history_hash_write(const dt_imgid_t imgid,

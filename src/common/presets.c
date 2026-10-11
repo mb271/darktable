@@ -20,11 +20,11 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/exif.h"
-#include "common/file_location.h"
+#include "common/utility.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "libs/lib.h"
-
+#include <glib-2.0/gio/gmenu.h>
 #include <libxml/encoding.h>
 #include <libxml/xmlwriter.h>
 #include <libxml/parser.h>
@@ -482,25 +482,14 @@ char *dt_presets_get_multi_name(const char *name,
     return g_strdup(strlen(multi_name) > 0 ? multi_name : "");
 }
 
-static void _menu_shell_insert_sorted(GtkWidget *menu_shell,
-                                      GtkWidget *item,
-                                      const gchar *name)
-{
-  GList *items = gtk_container_get_children(GTK_CONTAINER(menu_shell));
-  int num = g_list_length(items);
-  for(GList *i = g_list_last(items); i; i = i->prev, num--)
-    if(g_utf8_collate(gtk_menu_item_get_label(i->data), name) < 0) break;
-  gtk_menu_shell_insert(GTK_MENU_SHELL(menu_shell), item, num);
-  g_list_free(items);
-}
-
-GtkWidget *dt_insert_preset_in_menu_hierarchy(const char *name,
-                                              GSList **menu_path,
-                                              GtkWidget *mainmenu,
-                                              GtkWidget **submenu,
-                                              gchar ***prev_split,
-                                              gboolean isdefault,
-                                              gboolean writeprotect)
+void dt_insert_preset_in_menu_hierarchy(const char *name,
+                                        const char *action,
+                                        GSList **menu_path,
+                                        GMenu *mainmenu,
+                                        GMenu **submenu,
+                                        gchar ***prev_split,
+                                        gboolean isdefault,
+                                        gboolean writeprotect)
 {
   gchar *local_name =
     writeprotect ?
@@ -511,41 +500,75 @@ GtkWidget *dt_insert_preset_in_menu_hierarchy(const char *name,
   gchar **s = split;
   gchar **p = *prev_split;
   GSList *mpath = *menu_path;
-  GtkWidget *mi;
+  GMenuItem *mi;
   g_free(local_name);
+
   for(; p && *(p+1) && *(s+1) && !g_strcmp0(*s, *p); p++, s++)
     ;
+
   for(; p && *(p+1); p++)
   {
     mpath = g_slist_delete_link(mpath, mpath); // pop
-    *submenu = mpath ? gtk_menu_item_get_submenu(mpath->data) : mainmenu;
+    *submenu = mpath ? mpath->data : mainmenu;
   }
+
   for(; *(s+1); s++)
   {
-    GtkWidget *sm = gtk_menu_item_new_with_label(*s);
-    mpath = g_slist_prepend(mpath, sm); // push
+    GMenu *sm = g_menu_new();
 
-    _menu_shell_insert_sorted(*submenu, sm, *s);
-    *submenu = gtk_menu_new();
-    gtk_menu_item_set_submenu(GTK_MENU_ITEM(sm), *submenu);
+    // TODO: Gtk4:
+    // prefix the parent's label: gtk3 flattens GtkPopoverMenu into a single
+    // GtkStack and names each page after its item label, so equally named
+    // submenus under different presets collide and navigation follows the
+    // first one. under gtk4 dt_gui_popover_menu_from_model() nests the menu
+    // for real (GTK_POPOVER_MENU_NESTED) and the prefix can go
+    gchar *sm_name = NULL;
+    gchar *label_unm = NULL;
+    gchar **s2 = split;
+    for(; s2 != s; s2++)
+    {
+      label_unm = dt_str_unmnemonic(*s2);
+      dt_util_str_cat(&sm_name, "%s - ", label_unm);
+      g_free(label_unm);
+    }
+    label_unm = dt_str_unmnemonic(*s);
+    dt_util_str_cat(&sm_name, "%s", label_unm);
+    g_free(label_unm);
+    GMenuItem *smi = g_menu_item_new_submenu(sm_name, G_MENU_MODEL(sm));
+    g_free(sm_name);
+    // Gtk4:
+    // label_unm = dt_str_unmnemonic(*s);
+    // GMenuItem *smi = g_menu_item_new_submenu(label_unm, G_MENU_MODEL(sm));
+    // g_free(label_unm);
+
+    g_menu_append_item(*submenu, smi);
+    g_object_unref(smi);
+    *submenu = sm;
+    mpath = g_slist_prepend(mpath, sm); // push
   }
+
   *menu_path = mpath;
   g_strfreev(*prev_split);
   *prev_split = split;
+
   if(isdefault)
   {
     gchar *label = g_strdup_printf("%s %s", *s, _("(default)"));
-    mi = gtk_check_menu_item_new_with_label(label);
-    _menu_shell_insert_sorted(*submenu, mi, label);
+    gchar *label_unm = dt_str_unmnemonic(label);
+    mi = g_menu_item_new(label_unm, action);
+    g_menu_append_item(*submenu, mi);
+    g_object_unref(mi);
     g_free(label);
+    g_free(label_unm);
   }
   else
   {
-    mi = gtk_check_menu_item_new_with_label(*s);
-    _menu_shell_insert_sorted(*submenu, mi, *s);
+    gchar *label_unm = dt_str_unmnemonic(*s);
+    mi = g_menu_item_new(label_unm, action);
+    g_menu_append_item(*submenu, mi);
+    g_object_unref(mi);
+    g_free(label_unm);
   }
-  dt_gui_add_class(mi, "dt_transparent_background");
-  return mi;
 }
 
 // clang-format off
